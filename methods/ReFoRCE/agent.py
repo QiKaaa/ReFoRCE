@@ -368,7 +368,8 @@ class REFORCE:
                     result_all[key] = same_ans
             result_name = filter_bijection_like_dict(result_name)
             for key, value in result_name.items():
-                result[key.split("/")[-1].replace(".csv", ".sql")] = len(value)
+                # 使用 os.path.basename 替代 split("/")，兼容 Windows 路径
+                result[os.path.basename(key).replace(".csv", ".sql")] = len(value)
         if not result:
             if not result_all and not all_values:
                 print(f"{search_directory} empty results")
@@ -380,6 +381,8 @@ class REFORCE:
                 self.model_vote(result_all, sql_paths, search_directory, args, table_info, task)
             elif args.final_choose:
                 csv_pth = all_values[0]
+                # 确保目标目录存在
+                os.makedirs(os.path.dirname(self.complete_sql_save_path), exist_ok=True)
                 shutil.copy2(csv_pth.replace(".csv", ".sql"), self.complete_sql_save_path)
                 shutil.copy2(csv_pth, self.complete_csv_save_path) 
                 shutil.copy2(csv_pth.replace("result.csv", "log.log"), self.complete_log_save_path)               
@@ -403,6 +406,41 @@ class REFORCE:
                 print(f"{search_directory} has_tie {sorted_dict}, return")
                 return
 
-        shutil.copy2(os.path.join(search_directory, first_key), self.complete_sql_save_path)
-        shutil.copy2(os.path.join(search_directory, sql_paths[first_key]), self.complete_csv_save_path)
-        shutil.copy2(os.path.join(search_directory, first_key.replace(self.sql_save_name, self.log_save_name)), self.complete_log_save_path)
+        # 确保目标目录存在
+        target_dir = os.path.dirname(self.complete_sql_save_path)
+        if target_dir:  # 只有当目录路径非空时才创建
+            os.makedirs(target_dir, exist_ok=True)
+        
+        # 构建源文件路径并规范化
+        src_sql = os.path.normpath(os.path.join(search_directory, first_key))
+        src_csv = os.path.normpath(os.path.join(search_directory, sql_paths[first_key]))
+        src_log = os.path.normpath(os.path.join(search_directory, first_key.replace(self.sql_save_name, self.log_save_name)))
+        
+        # 规范化目标路径
+        dst_sql = os.path.normpath(self.complete_sql_save_path)
+        dst_csv = os.path.normpath(self.complete_csv_save_path)
+        dst_log = os.path.normpath(self.complete_log_save_path)
+        
+        # 调试信息
+        print(f"[投票] 复制获胜文件:")
+        print(f"  获胜: {first_key}")
+        print(f"  源SQL: {src_sql}")
+        print(f"    存在: {os.path.exists(src_sql)}")
+        print(f"  目标SQL: {dst_sql}")
+        print(f"    目标目录: {os.path.dirname(dst_sql)}")
+        print(f"    目标目录存在: {os.path.exists(os.path.dirname(dst_sql))}")
+        
+        # 检查源文件是否存在
+        if not os.path.exists(src_sql):
+            raise FileNotFoundError(f"源SQL文件不存在: {src_sql}")
+        if not os.path.exists(src_csv):
+            raise FileNotFoundError(f"源CSV文件不存在: {src_csv}")
+        if not os.path.exists(src_log):
+            raise FileNotFoundError(f"源LOG文件不存在: {src_log}")
+        
+        # 执行复制
+        shutil.copy2(src_sql, dst_sql)
+        shutil.copy2(src_csv, dst_csv)
+        shutil.copy2(src_log, dst_log)
+        
+        print(f"  ✓ 投票完成，结果已保存")

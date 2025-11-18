@@ -13,6 +13,7 @@
 - ✅ 解析 `M-schema/final_algorithm_competition.txt`
 - ✅ 按数据表进行 chunk 划分
 - ✅ 根据 `table_list` 动态获取相关表的 Schema
+- ✅ **LLM-based Schema Linking**: 一次性分析所有相关表，智能选择列
 
 ### 3. **SQL方言**
 - ✅ StarRocks 方言支持（MySQL兼容语法）
@@ -23,15 +24,16 @@
 
 ```
 methods/ReFoRCE/
-├── sql_starrocks.py          # StarRocks SQL执行引擎
-├── schema_parser.py           # Schema文件解析器
-├── data_loader.py             # 数据集加载器
-├── prompt_starrocks.py        # StarRocks方言Prompt
-├── run_starrocks.py           # 主运行脚本
-├── run_starrocks.sh           # Bash启动脚本
-├── run_starrocks.ps1          # PowerShell启动脚本
-├── requirements_starrocks.txt # 依赖文件
-└── README_STARROCKS.md        # 本文档
+├── sql_starrocks.py               # StarRocks SQL执行引擎
+├── schema_parser.py               # Schema文件解析器
+├── schema_linking_optimized.py    # LLM-based Schema Linking (优化版)
+├── data_loader.py                 # 数据集加载器
+├── prompt_starrocks.py            # StarRocks方言Prompt
+├── run_starrocks.py               # 主运行脚本
+├── run_starrocks.sh               # Bash启动脚本
+├── run_starrocks.ps1              # PowerShell启动脚本
+├── requirements_starrocks.txt     # 依赖文件
+└── README_STARROCKS.md            # 本文档
 ```
 
 ## 🚀 快速开始
@@ -123,7 +125,35 @@ python run_starrocks.py \
 - ❌ 列探索
 - ❌ 投票
 
-### 模式2: 列探索模式
+### 模式2: Schema Linking模式 (新增✨)
+```powershell
+python run_starrocks.py \
+  --use_schema_linking \
+  --generation_model gpt-4o \
+  --do_self_refinement \
+  --max_iter 5
+```
+- ✅ LLM智能列选择（一次性分析所有表）
+- ✅ 显著减少prompt token
+- ✅ 保持准确率
+- ✅ 自我精化
+
+### 模式3: Schema Linking投票模式 (推荐⭐)
+```powershell
+python run_starrocks.py \
+  --do_schema_linking_vote \
+  --do_vote \
+  --generation_model gpt-4o \
+  --num_votes 3 \
+  --random_vote_for_tie \
+  --max_iter 5
+```
+- ✅ 原始Schema + Linked Schema 双路径
+- ✅ 投票选择最优SQL
+- ✅ 最高准确率
+- ✅ 成本略高但效果最佳
+
+### 模式4: 列探索模式
 ```powershell
 python run_starrocks.py \
   --generation_model gpt-4o \
@@ -138,7 +168,7 @@ python run_starrocks.py \
 - ✅ 自我一致性
 - ❌ 投票
 
-### 模式3: 完整模式（推荐）
+### 模式5: 完整模式
 ```powershell
 python run_starrocks.py \
   --generation_model gpt-4o \
@@ -187,6 +217,8 @@ python run_starrocks.py \
 | `--do_self_consistency` | 启用自我一致性检查 |
 | `--do_vote` | 启用投票机制 |
 | `--do_format_restriction` | 启用格式限制 |
+| `--use_schema_linking` | 启用Schema Linking (单独使用) |
+| `--do_schema_linking_vote` | 启用Schema Linking投票模式 |
 
 ### 运行控制
 | 参数 | 默认值 | 说明 |

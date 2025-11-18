@@ -1,12 +1,11 @@
 """
-优化的 Schema Linking 方案
+优化的 Schema Linking 方案 (基于 LLM)
 专为 final_algorithm_competition 数据集设计
 
 特点:
-1. 直接使用标注的 table_list (零成本,100%准确)
-2. 从 knowledge 字段提取列名
-3. 从 question 字段匹配列名
-4. 智能 Schema 压缩
+1. 使用标注的 table_list 确定相关表
+2. 使用 LLM 分析每个表的列,选择相关列
+3. 输出 M-schema 格式的精简 schema
 """
 
 import os
@@ -14,9 +13,12 @@ import json
 import csv
 import re
 import sys
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 from tqdm import tqdm
 import argparse
+
+# 导入 GPT Chat
+from chat import GPTChat
 
 # 设置 CSV 字段大小限制 (处理 Windows 平台的限制)
 try:
@@ -25,256 +27,251 @@ except OverflowError:
     csv.field_size_limit(2**31 - 1)
 
 
+# LLM Prompt for Schema Linking
+SCHEMA_LINKING_PROMPT = """You are performing column-level schema linking for SQL generation.
+
+Given:
+1. Question: The user's question that needs to be answered
+2. Knowledge: Domain-specific knowledge and constraints
+3. All Table Schemas: Complete schemas of all relevant tables in M-schema format
+
+Your task:
+Analyze which columns from each table are relevant to answer the question, considering the knowledge constraints and table relationships.
+
+Rules:
+1. Select ALL columns that might be needed (including filter columns, join columns, and output columns)
+2. Always keep ID fields and date/time fields
+3. Consider both direct usage and indirect usage (e.g., for JOINs)
+4. Consider relationships between tables when selecting columns
+5. Return the selected columns in the EXACT same format as shown in the table schemas
+
+Please respond ONLY with a JSON code block:
+```json
+{{
+    "think": "Brief reasoning about which columns are relevant and why, including table relationships",
+    "tables": {{
+        "table_name1": [
+            "(column_name1: type, comment, Examples: [examples])",
+            "(column_name2: type, comment, Examples: [examples])",
+            ...
+        ],
+        "table_name2": [
+            "(column_name1: type, comment, Examples: [examples])",
+            ...
+        ]
+    }}
+}}
+```
+
+Important: Copy the column definition EXACTLY as it appears in the table schema, including the parentheses, colon, comma, and examples.
+
+---
+
+Question: {question}
+
+Knowledge: {knowledge}
+
+All Table Schemas:
+{all_table_schemas}
+
+Please analyze and return the selected columns for each table in the JSON format above.
+"""
+
+
 class OptimizedSchemaLinker:
-    """优化的 Schema Linking 类"""
+    """优化的 Schema Linking 类 (基于 LLM)"""
     
-    def __init__(self, schema_file: str):
+    def __init__(self, schema_file: str, chat_session: Optional[GPTChat] = None):
         """
         初始化
         Args:
             schema_file: schema 文件路径 (如 final_algorithm_competition.txt)
+            chat_session: GPT Chat 会话 (可选)
         """
         self.schema_file = schema_file
-        self.all_tables = {}  # {table_name: {columns: [...], descriptions: {...}}}
+        self.all_tables = {}  # {table_name: table_schema_text}
+        self.chat_session = chat_session
         self._load_schema()
     
     def _load_schema(self):
-        """从 schema 文件加载所有表和列信息"""
+        """从 schema 文件加载所有表的完整 schema 文本"""
         with open(self.schema_file, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # 解析表定义
-        table_pattern = r'# Table: ([^,]+),([^\n]+)\n\[(.*?)\n\]'
-        matches = re.finditer(table_pattern, content, re.DOTALL)
-        
-        for match in matches:
+        # 解析每个表的完整定义 (保持 M-schema 格式)
+        # 找到所有表的起始位置
+        table_starts = []
+        for match in re.finditer(r'# Table: ([^,]+)', content):
             table_name = match.group(1).strip()
-            table_desc = match.group(2).strip()
-            columns_block = match.group(3)
-            
-            columns = []
-            col_desc = {}
-            
-            # 解析列定义
-            col_pattern = r'\(([^:]+):([^,]+),([^,\)]+)(?:, Examples: \[([^\]]*)\])?\)'
-            for col_match in re.finditer(col_pattern, columns_block):
-                col_name = col_match.group(1).strip()
-                col_type = col_match.group(2).strip()
-                col_comment = col_match.group(3).strip()
-                examples = col_match.group(4) if col_match.group(4) else ""
-                
-                columns.append(col_name)
-                col_desc[col_name] = {
-                    'type': col_type,
-                    'comment': col_comment,
-                    'examples': examples
-                }
-            
-            self.all_tables[table_name] = {
-                'description': table_desc,
-                'columns': columns,
-                'column_details': col_desc
-            }
+            start_pos = match.start()
+            table_starts.append((table_name, start_pos))
         
-        print(f"已加载 {len(self.all_tables)} 张表的 schema 信息")
+        # 提取每个表的完整文本
+        for i, (table_name, start_pos) in enumerate(table_starts):
+            # 找到下一个表的开始位置或文件结束
+            if i + 1 < len(table_starts):
+                end_pos = table_starts[i + 1][1]
+            else:
+                end_pos = len(content)
+            
+            # 提取表的完整文本
+            table_text = content[start_pos:end_pos].strip()
+            self.all_tables[table_name] = table_text
+        
+        print(f"✓ 已加载 {len(self.all_tables)} 张表的 schema 信息")
     
-    def extract_columns_from_knowledge(self, knowledge: str) -> Set[str]:
+    def _parse_llm_response(self, response: str) -> Dict[str, List[str]]:
         """
-        从 knowledge 字段提取相关列名
+        解析 LLM 返回的多表列列表
         
         Args:
-            knowledge: knowledge 字符串
+            response: LLM 的响应
             
         Returns:
-            提取到的列名集合
+            字典: {table_name: [列定义列表]}
         """
-        if not knowledge:
-            return set()
-        
-        columns = set()
-        
-        # 提取条件中的列名 (如: sgamecode in (...), saccounttype = "...")
-        # 匹配模式: 列名 后面跟 =, in, >, <, >= 等
-        patterns = [
-            r'\b([a-z_][a-z0-9_]*)\s*(?:=|in|>|<|>=|<=|!=)',  # 条件表达式
-            r'\b([a-z_][a-z0-9_]*)\s*\(.*?\)',  # 函数调用
-            r'sum\(([a-z_][a-z0-9_]*)\)',  # 聚合函数
-            r'count\((?:distinct\s+)?([a-z_][a-z0-9_]*)\)',
-            r'max\(([a-z_][a-z0-9_]*)\)',
-            r'min\(([a-z_][a-z0-9_]*)\)',
-        ]
-        
-        for pattern in patterns:
-            for match in re.finditer(pattern, knowledge, re.IGNORECASE):
-                col_name = match.group(1).lower()
-                # 过滤掉 SQL 关键字
-                if col_name not in ['and', 'or', 'not', 'in', 'is', 'null', 'case', 'when', 'then', 'else', 'end']:
-                    columns.add(col_name)
-        
-        return columns
-    
-    def extract_columns_from_question(self, question: str, table_columns: List[str]) -> Set[str]:
-        """
-        从问题中匹配列名
-        
-        Args:
-            question: 问题文本
-            table_columns: 表的所有列名
-            
-        Returns:
-            匹配到的列名集合
-        """
-        matched_columns = set()
-        question_lower = question.lower()
-        
-        for col in table_columns:
-            col_lower = col.lower()
-            # 如果列名在问题中出现
-            if col_lower in question_lower:
-                matched_columns.add(col)
-        
-        # 也可以根据列的注释匹配
-        # 这里暂时简化处理
-        
-        return matched_columns
-    
-    def get_key_columns(self, table_name: str) -> Set[str]:
-        """
-        获取表的关键列 (主键、外键、时间字段等)
-        
-        Args:
-            table_name: 表名
-            
-        Returns:
-            关键列集合
-        """
-        if table_name not in self.all_tables:
-            return set()
-        
-        key_columns = set()
-        columns = self.all_tables[table_name]['column_details']
-        
-        for col_name, col_info in columns.items():
-            col_lower = col_name.lower()
-            comment_lower = col_info['comment'].lower()
-            
-            # 识别关键字段
-            if any(keyword in col_lower for keyword in [
-                'id', 'date', 'time', 'dt', 'key', 'userid', 'playerid',
-                'vplayerid', 'gplayerid', 'suserid', 'iuserid', 'vroleid'
-            ]):
-                key_columns.add(col_name)
-            
-            # 识别日期/时间字段
-            if any(keyword in comment_lower for keyword in [
-                '日期', '时间', 'id', '标识', '主键', '外键'
-            ]):
-                key_columns.add(col_name)
-        
-        return key_columns
+        try:
+            # 提取 JSON code block
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                data = json.loads(json_str)
+                return data.get('tables', {})
+            else:
+                print(f"警告: 无法从 LLM 响应中提取 JSON")
+                return {}
+        except Exception as e:
+            print(f"警告: 解析 LLM 响应失败: {e}")
+            return {}
     
     def link_schema(self, 
                    question: str, 
                    table_list: List[str], 
                    knowledge: str = "",
-                   max_examples: int = 3) -> Dict[str, Dict]:
+                   chat_session: Optional[GPTChat] = None) -> str:
         """
-        执行 Schema Linking
+        执行 Schema Linking (使用 LLM 一次性分析所有表)
         
         Args:
             question: 问题文本
             table_list: 标注的相关表列表
             knowledge: knowledge 字段
-            max_examples: 每列最多保留的示例数
+            chat_session: GPT Chat 会话 (可选,如果不提供则使用初始化时的)
             
         Returns:
-            {table_name: {columns: [...], column_details: {...}}}
+            M-schema 格式的精简 schema 文本
         """
-        linked_schema = {}
+        # 使用提供的 chat_session 或默认的
+        session = chat_session or self.chat_session
         
-        # 从 knowledge 提取列名
-        cols_from_knowledge = self.extract_columns_from_knowledge(knowledge)
+        if session is None:
+            raise ValueError("未提供 chat_session,请在初始化或调用时提供")
+        
+        # 收集所有相关表的 schema
+        all_table_schemas = []
+        valid_tables = []
         
         for table_name in table_list:
             if table_name not in self.all_tables:
                 print(f"警告: 表 {table_name} 不在 schema 中")
                 continue
             
-            table_info = self.all_tables[table_name]
-            
-            # 从问题匹配列名
-            cols_from_question = self.extract_columns_from_question(
-                question, 
-                table_info['columns']
-            )
-            
-            # 获取关键列
-            key_columns = self.get_key_columns(table_name)
-            
-            # 合并所有相关列
-            relevant_columns = cols_from_knowledge | cols_from_question | key_columns
-            
-            # 如果没有找到任何相关列,保留所有列 (安全策略)
-            if not relevant_columns:
-                relevant_columns = set(table_info['columns'])
-            
-            # 构建压缩后的列信息
-            compressed_cols = {}
-            for col in relevant_columns:
-                if col in table_info['column_details']:
-                    col_detail = table_info['column_details'][col].copy()
-                    # 限制示例数量
-                    if col_detail['examples']:
-                        examples = col_detail['examples'].split(', ')[:max_examples]
-                        col_detail['examples'] = ', '.join(examples)
-                    compressed_cols[col] = col_detail
-            
-            linked_schema[table_name] = {
-                'description': table_info['description'],
-                'columns': list(relevant_columns),
-                'column_details': compressed_cols
-            }
+            valid_tables.append(table_name)
+            all_table_schemas.append(self.all_tables[table_name])
         
-        return linked_schema
+        if not valid_tables:
+            print("警告: 没有有效的表")
+            return ""
+        
+        # 合并所有表的 schema
+        combined_schemas = "\n\n".join(all_table_schemas)
+        
+        # 构建 prompt (一次性给所有表)
+        prompt = SCHEMA_LINKING_PROMPT.format(
+            question=question,
+            knowledge=knowledge if knowledge else "None",
+            all_table_schemas=combined_schemas
+        )
+        
+        try:
+            # 调用 LLM (一次性处理所有表)
+            response = session.get_response(prompt)
+            # print(f"🔮 LLM Schema Linking 响应:\n{response}")
+            
+            # 解析响应
+            tables_columns = self._parse_llm_response(response)
+            
+            if not tables_columns:
+                # 如果 LLM 没有返回结果,使用完整 schema
+                print(f"警告: LLM 响应为空,使用完整 schema")
+                return combined_schemas
+            
+            # 重建每个表的 M-schema 格式
+            linked_tables = []
+            
+            for table_name in valid_tables:
+                if table_name not in tables_columns:
+                    # 如果 LLM 没有返回这个表的列,使用完整表
+                    print(f"警告: {table_name} 未在 LLM 响应中,使用完整表")
+                    linked_tables.append(self.all_tables[table_name])
+                    continue
+                
+                selected_columns = tables_columns[table_name]
+                
+                if not selected_columns:
+                    # 如果这个表的列列表为空,使用完整表
+                    print(f"警告: {table_name} 的列列表为空,使用完整表")
+                    linked_tables.append(self.all_tables[table_name])
+                    continue
+                
+                # 提取表头
+                table_schema = self.all_tables[table_name]
+                table_header_match = re.search(r'# Table: [^,\n]+,[^\n]+', table_schema)
+                if table_header_match:
+                    table_header = table_header_match.group(0)
+                else:
+                    table_header = f"# Table: {table_name}, (描述未找到)"
+                
+                # 构建精简的表定义
+                linked_table = f"{table_header}\n[\n"
+                for col_def in selected_columns:
+                    linked_table += f"{col_def},\n"
+                
+                # 移除最后一个逗号
+                if linked_table.endswith(',\n'):
+                    linked_table = linked_table[:-2] + '\n'
+                
+                linked_table += "]\n"
+                linked_tables.append(linked_table)
+            
+            # 合并所有表
+            return "\n".join(linked_tables)
+                    
+        except Exception as e:
+            print(f"错误: Schema Linking 时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            # 出错时使用完整 schema
+            return combined_schemas
     
-    def format_schema_prompt(self, linked_schema: Dict[str, Dict]) -> str:
+    def format_schema_prompt(self, linked_schema_text: str) -> str:
         """
-        将 linked schema 格式化为 prompt
+        格式化 schema 文本 (已经是 M-schema 格式,直接返回)
         
         Args:
-            linked_schema: link_schema() 的返回结果
+            linked_schema_text: link_schema() 的返回结果
             
         Returns:
-            格式化的 schema 字符串
+            格式化的 schema 字符串 (与输入相同)
         """
-        lines = []
-        
-        for table_name, table_info in linked_schema.items():
-            lines.append(f"# Table: {table_name}, {table_info['description']}")
-            lines.append("[")
-            
-            for col in table_info['columns']:
-                if col in table_info['column_details']:
-                    col_detail = table_info['column_details'][col]
-                    examples_str = f", Examples: [{col_detail['examples']}]" if col_detail['examples'] else ""
-                    lines.append(
-                        f"({col}:{col_detail['type']}, {col_detail['comment']}{examples_str}),"
-                    )
-            
-            # 移除最后一个逗号
-            if lines[-1].endswith(','):
-                lines[-1] = lines[-1][:-1]
-            
-            lines.append("]")
-            lines.append("")
-        
-        return "\n".join(lines)
+        return linked_schema_text
 
 
 def process_dataset(dataset_path: str, 
                     schema_file: str, 
                     output_dir: str,
-                    max_examples: int = 3):
+                    model: str = "deepseek-chat",
+                    azure: bool = False):
     """
     处理整个数据集
     
@@ -282,7 +279,8 @@ def process_dataset(dataset_path: str,
         dataset_path: 数据集 JSON 文件路径
         schema_file: schema 文件路径
         output_dir: 输出目录
-        max_examples: 每列最多保留的示例数
+        model: LLM 模型名称
+        azure: 是否使用 Azure
     """
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
@@ -294,6 +292,9 @@ def process_dataset(dataset_path: str,
     # 创建 linker
     linker = OptimizedSchemaLinker(schema_file)
     
+    # 创建 chat session
+    chat_session = GPTChat(azure=azure, model=model, temperature=0)
+    
     # 处理每个样本
     results = []
     
@@ -303,16 +304,15 @@ def process_dataset(dataset_path: str,
         table_list = example['table_list']
         knowledge = example.get('knowledge', '')
         
+        print(f"处理: {sql_id}")
+        
         # 执行 schema linking
         linked_schema = linker.link_schema(
             question=question,
             table_list=table_list,
             knowledge=knowledge,
-            max_examples=max_examples
+            chat_session=chat_session
         )
-        
-        # 格式化为 prompt
-        schema_prompt = linker.format_schema_prompt(linked_schema)
         
         # 保存结果
         result = {
@@ -321,64 +321,24 @@ def process_dataset(dataset_path: str,
             'knowledge': knowledge,
             'table_list': table_list,
             'linked_schema': linked_schema,
-            'schema_prompt': schema_prompt,
             '复杂度': example.get('复杂度', '')
         }
         
         results.append(result)
         
-        # 保存单个样本的 schema prompt
+        # 保存单个样本的 schema
         with open(os.path.join(output_dir, f"{sql_id}_schema.txt"), 'w', encoding='utf-8') as f:
-            f.write(schema_prompt)
+            f.write(linked_schema)
     
     # 保存所有结果
     with open(os.path.join(output_dir, 'schema_linking_results.json'), 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
-    # 统计信息
-    print("\n=== Schema Linking 统计 ===")
-    total_tables_before = sum(len(ex['table_list']) for ex in dataset)
-    total_tables_after = sum(len(r['linked_schema']) for r in results)
-    
-    total_cols_before = 0
-    total_cols_after = 0
-    
-    for result in results:
-        for table in result['table_list']:
-            if table in linker.all_tables:
-                total_cols_before += len(linker.all_tables[table]['columns'])
-        
-        for table_info in result['linked_schema'].values():
-            total_cols_after += len(table_info['columns'])
-    
-    print(f"样本数: {len(dataset)}")
-    print(f"表数 (前): {total_tables_before}, (后): {total_tables_after}")
-    print(f"列数 (前): {total_cols_before}, (后): {total_cols_after}")
-    print(f"列压缩比: {total_cols_after / total_cols_before * 100:.1f}%")
-    
-    # 按复杂度统计
-    complexity_stats = {}
-    for result in results:
-        complexity = result['复杂度']
-        if complexity not in complexity_stats:
-            complexity_stats[complexity] = {'count': 0, 'avg_tables': 0, 'avg_cols': 0}
-        
-        complexity_stats[complexity]['count'] += 1
-        complexity_stats[complexity]['avg_tables'] += len(result['linked_schema'])
-        complexity_stats[complexity]['avg_cols'] += sum(
-            len(t['columns']) for t in result['linked_schema'].values()
-        )
-    
-    print("\n按复杂度统计:")
-    for complexity, stats in complexity_stats.items():
-        count = stats['count']
-        avg_tables = stats['avg_tables'] / count
-        avg_cols = stats['avg_cols'] / count
-        print(f"  {complexity}: {count}个, 平均 {avg_tables:.1f} 张表, {avg_cols:.1f} 列")
+    print(f"\n✅ 完成! 结果保存到: {output_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='优化的 Schema Linking')
+    parser = argparse.ArgumentParser(description='优化的 Schema Linking (基于 LLM)')
     parser.add_argument('--dataset', type=str, 
                        default='e:/Project/track3_2/final_for_student/data/final_dataset_example.json',
                        help='数据集路径')
@@ -388,8 +348,10 @@ def main():
     parser.add_argument('--output', type=str,
                        default='e:/Project/track3_2/output/schema_linking',
                        help='输出目录')
-    parser.add_argument('--max_examples', type=int, default=3,
-                       help='每列最多保留的示例数')
+    parser.add_argument('--model', type=str, default='deepseek-chat',
+                       help='LLM 模型名称')
+    parser.add_argument('--azure', action='store_true',
+                       help='使用 Azure OpenAI')
     
     args = parser.parse_args()
     
@@ -397,7 +359,8 @@ def main():
         dataset_path=args.dataset,
         schema_file=args.schema,
         output_dir=args.output,
-        max_examples=args.max_examples
+        model=args.model,
+        azure=args.azure
     )
 
 

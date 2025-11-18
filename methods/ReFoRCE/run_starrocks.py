@@ -19,6 +19,9 @@ from schema_parser import SchemaParser
 from data_loader import DatasetLoader
 from dotenv import load_dotenv
 
+# 导入 Schema Linking
+from schema_linking_optimized import OptimizedSchemaLinker
+
 # 加载.env文件中的环境变量
 load_dotenv()
 
@@ -34,7 +37,8 @@ def execute_single_question(
     sql_id, question, table_list, knowledge, 
     schema_parser, args, 
     csv_save_path, log_save_path, sql_save_path, 
-    search_directory, format_csv
+    search_directory, format_csv,
+    schema_linker=None, use_schema_linking=False
 ):
     """
     执行单个问题
@@ -51,6 +55,8 @@ def execute_single_question(
         sql_save_path: SQL保存路径
         search_directory: 搜索目录
         format_csv: 格式化CSV
+        schema_linker: Schema Linking器（可选）
+        use_schema_linking: 是否使用Schema Linking
     """
     
     # 如果结果已存在且不允许覆盖，则跳过
@@ -71,12 +77,33 @@ def execute_single_question(
     log_file_path = os.path.join(search_directory, log_save_path)
     logger = initialize_logger(log_file_path)
     
-    # 获取相关表的Schema
-    table_info = schema_parser.get_tables_chunks(table_list)
+    # 根据use_schema_linking决定使用哪种schema
+    if use_schema_linking and schema_linker:
+        # 使用Schema Linking获取精简的Schema
+        logger.info("[Schema Linking] Generating optimized schema...")
+        
+        # 创建 chat session
+        chat_session_sl = GPTChat(
+            args.azure if hasattr(args, 'azure') else False,
+            args.generation_model,
+            temperature=0
+        )
+        
+        linked_schema = schema_linker.link_schema(
+            question=question,
+            table_list=table_list,
+            knowledge=knowledge,
+            chat_session=chat_session_sl
+        )
+        table_info = linked_schema  # 已经是 M-schema 格式的文本
+        logger.info(f"[Schema Linking] Optimized schema generated")
+    else:
+        # 使用完整Schema（原方式）
+        table_info = schema_parser.get_tables_chunks(table_list)
     
     # 添加领域知识
     if knowledge:
-        table_info += f"\nDomain Knowledge:{knowledge}"
+        table_info += f"\n\nDomain Knowledge:\n{knowledge}\n"
     
     logger.info(f"[Table Info]\n{table_info}\n[Table Info]")
     
@@ -90,14 +117,14 @@ def execute_single_question(
     chat_session = None
     
     if args.do_column_exploration:
-        chat_session_ex = ChatClass(
+        chat_session_ex = GPTChat(
             args.azure, 
             args.column_exploration_model, 
             temperature=args.temperature
         )
     
     if args.generation_model:
-        chat_session = ChatClass(
+        chat_session = GPTChat(
             args.azure, 
             args.generation_model, 
             temperature=args.temperature
@@ -159,7 +186,7 @@ def execute_single_question(
         agent.sql_env.close_db()
 
 
-def process_question(sql_id, example, schema_parser, args):
+def process_question(sql_id, example, schema_parser, schema_linker, args):
     """处理单个问题（用于并行执行）"""
     start_time = time.time()
     
@@ -203,7 +230,7 @@ def process_question(sql_id, example, schema_parser, args):
     # 格式限制（可选）
     format_csv = None
     if args.do_format_restriction:
-        chat_session_format = ChatClass(
+        chat_session_format = GPTChat(
             args.azure, 
             args.format_model, 
             temperature=args.temperature
@@ -212,27 +239,73 @@ def process_question(sql_id, example, schema_parser, args):
     
     # 投票模式
     if args.do_vote:
-        num_votes = args.num_votes
         sql_paths = {}
         threads = []
         
-        for i in range(num_votes):
-            csv_save_pathi = str(i) + agent_format.csv_save_name
-            log_pathi = str(i) + agent_format.log_save_name
-            sql_save_pathi = str(i) + agent_format.sql_save_name
-            sql_paths[sql_save_pathi] = csv_save_pathi
+        # 如果启用Schema Linking投票，则生成两组SQL：原始Schema和Linked Schema
+        if args.do_schema_linking_vote:
+            num_votes = args.num_votes
             
-            thread = threading.Thread(
-                target=execute_single_question,
-                args=(
-                    sql_id, question, table_list, knowledge,
-                    schema_parser, args,
-                    csv_save_pathi, log_pathi, sql_save_pathi,
-                    search_directory, format_csv
+            # 第一组：使用原始Schema生成（num_votes次）
+            for i in range(num_votes):
+                csv_save_pathi = f"original_{i}_{agent_format.csv_save_name}"
+                log_pathi = f"original_{i}_{agent_format.log_save_name}"
+                sql_save_pathi = f"original_{i}_{agent_format.sql_save_name}"
+                sql_paths[sql_save_pathi] = csv_save_pathi
+                
+                thread = threading.Thread(
+                    target=execute_single_question,
+                    args=(
+                        sql_id, question, table_list, knowledge,
+                        schema_parser, args,
+                        csv_save_pathi, log_pathi, sql_save_pathi,
+                        search_directory, format_csv,
+                        None, False  # 不使用schema linking
+                    )
                 )
-            )
-            threads.append(thread)
-            thread.start()
+                threads.append(thread)
+                thread.start()
+            
+            # 第二组：使用Schema Linking生成（num_votes次）
+            for i in range(num_votes):
+                csv_save_pathi = f"linked_{i}_{agent_format.csv_save_name}"
+                log_pathi = f"linked_{i}_{agent_format.log_save_name}"
+                sql_save_pathi = f"linked_{i}_{agent_format.sql_save_name}"
+                sql_paths[sql_save_pathi] = csv_save_pathi
+                
+                thread = threading.Thread(
+                    target=execute_single_question,
+                    args=(
+                        sql_id, question, table_list, knowledge,
+                        schema_parser, args,
+                        csv_save_pathi, log_pathi, sql_save_pathi,
+                        search_directory, format_csv,
+                        schema_linker, True  # 使用schema linking
+                    )
+                )
+                threads.append(thread)
+                thread.start()
+        else:
+            # 原始投票模式：只使用原始Schema
+            num_votes = args.num_votes
+            for i in range(num_votes):
+                csv_save_pathi = str(i) + agent_format.csv_save_name
+                log_pathi = str(i) + agent_format.log_save_name
+                sql_save_pathi = str(i) + agent_format.sql_save_name
+                sql_paths[sql_save_pathi] = csv_save_pathi
+                
+                thread = threading.Thread(
+                    target=execute_single_question,
+                    args=(
+                        sql_id, question, table_list, knowledge,
+                        schema_parser, args,
+                        csv_save_pathi, log_pathi, sql_save_pathi,
+                        search_directory, format_csv,
+                        None, False
+                    )
+                )
+                threads.append(thread)
+                thread.start()
         
         # 等待所有线程完成
         for thread in threads:
@@ -254,7 +327,7 @@ def process_question(sql_id, example, schema_parser, args):
                 # 执行投票
                 table_info = schema_parser.get_tables_chunks(table_list)
                 if knowledge:
-                    table_info += f"\n\nDomain Knowledge:\n{knowledge}\n"
+                    table_info += f"Domain Knowledge:\n{knowledge}"
                 agent_format.vote_result(search_directory, args, sql_paths, table_info, question)
             else:
                 print(f"{sql_id}: Empty")
@@ -265,7 +338,9 @@ def process_question(sql_id, example, schema_parser, args):
             schema_parser, args,
             agent_format.csv_save_name, agent_format.log_save_name, 
             agent_format.sql_save_name,
-            search_directory, format_csv
+            search_directory, format_csv,
+            schema_linker if args.use_schema_linking else None,
+            args.use_schema_linking if hasattr(args, 'use_schema_linking') else False
         )
     
     elapsed = int((time.time() - start_time) // 60)
@@ -293,6 +368,14 @@ def main(args):
     print(f"  数据库: {schema_parser.db_id}")
     print(f"  表数量: {len(schema_parser.tables)}")
     
+    # 初始化Schema Linker（如果需要）
+    global schema_linker
+    schema_linker = None
+    if args.do_schema_linking_vote or args.use_schema_linking:
+        print(f"Initializing Schema Linker...")
+        schema_linker = OptimizedSchemaLinker(schema_file=args.schema_path)
+        print(f"  ✓ Schema Linker ready with {len(schema_linker.all_tables)} tables")
+    
     # 获取所有示例
     examples_dict = loader.get_example_dict()
     
@@ -310,10 +393,10 @@ def main(args):
         print(f"限制处理前 {args.max_questions} 个问题")
     
     # 并行处理
-    print(f"\n开始处理（使用 {args.num_workers} 个worker）...\n")
+    print(f"\n开始处理（使用 {args.num_workers} 个worker）...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         futures = [
-            executor.submit(process_question, sql_id, example, schema_parser, args)
+            executor.submit(process_question, sql_id, example, schema_parser, schema_linker, args)
             for sql_id, example in examples_dict.items()
         ]
         for future in concurrent.futures.as_completed(futures):
@@ -324,7 +407,7 @@ def main(args):
                 import traceback
                 traceback.print_exc()
     
-    print("\n✓ 所有问题处理完成！")
+    print("✓ 所有问题处理完成！")
 
 
 if __name__ == '__main__':
@@ -368,6 +451,12 @@ if __name__ == '__main__':
     parser.add_argument('--do_vote', action="store_true",
                        help="启用投票机制")
     
+    # Schema Linking 相关
+    parser.add_argument('--do_schema_linking_vote', action="store_true",
+                       help="启用Schema Linking投票：同时使用原始Schema和Linked Schema生成SQL并投票")
+    parser.add_argument('--use_schema_linking', action="store_true",
+                       help="直接使用Schema Linking（不投票模式）")
+    
     # 运行参数
     parser.add_argument('--max_iter', type=int, default=5, help="最大迭代次数")
     parser.add_argument('--temperature', type=float, default=1.0, help="采样温度")
@@ -404,9 +493,6 @@ if __name__ == '__main__':
     
     # 初始化Prompt类
     prompt_all = PromptsStarRocks()
-    
-    # 设置Chat类
-    ChatClass = GPTChat
     
     # 创建输出目录
     os.makedirs(args.output_path, exist_ok=True)

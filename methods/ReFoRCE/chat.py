@@ -65,7 +65,7 @@ class GPTChat(BaseChat):
                     api_key=os.environ.get("OPENAI_API_KEY"),
                     api_version="2024-12-01-preview"
                 )
-            elif model in ["deepseek-reasoner"]:
+            elif model in ["deepseek-chat"]:
                 self.client = OpenAI(
                     base_url="https://api.deepseek.com",
                     api_key=os.environ.get("DS_API_KEY"),
