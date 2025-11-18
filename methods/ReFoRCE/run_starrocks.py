@@ -17,8 +17,19 @@ import time
 from sql_starrocks import SqlEnvStarRocks
 from schema_parser import SchemaParser
 from data_loader import DatasetLoader
+from dotenv import load_dotenv
 
+# 加载.env文件中的环境变量
+load_dotenv()
 
+# 从.env文件中获取数据库配置
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', '9030')),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'database': os.getenv('DB_NAME', 'final_algorithm_competition')
+}
 def execute_single_question(
     sql_id, question, table_list, knowledge, 
     schema_parser, args, 
@@ -65,7 +76,7 @@ def execute_single_question(
     
     # 添加领域知识
     if knowledge:
-        table_info += f"\n\nDomain Knowledge:\n{knowledge}\n"
+        table_info += f"\nDomain Knowledge:{knowledge}"
     
     logger.info(f"[Table Info]\n{table_info}\n[Table Info]")
     
@@ -92,13 +103,13 @@ def execute_single_question(
             temperature=args.temperature
         )
     
-    # 初始化SQL环境（StarRocks）
+    # 初始化SQL环境（StarRocks）- 从.env文件中获取配置
     sql_env = SqlEnvStarRocks(
-        host=args.db_host,
-        port=args.db_port,
-        user=args.db_user,
-        password=args.db_password,
-        database=args.db_name
+        host=DB_CONFIG['host'],
+        port=DB_CONFIG['port'],
+        user=DB_CONFIG['user'],
+        password=DB_CONFIG['password'],
+        database=DB_CONFIG['database']
     )
     
     # 初始化Agent
@@ -111,7 +122,7 @@ def execute_single_question(
         chat_session_pre=chat_session_ex,
         chat_session=chat_session,
         log_save_path=sql_id + '/' + log_save_path,
-        db_id=args.db_name,
+        db_id=DB_CONFIG['database'],
         task="starrocks"
     )
     
@@ -174,6 +185,7 @@ def process_question(sql_id, example, schema_parser, args):
     
     # 跳过已完成的
     if os.path.exists(agent_format.complete_sql_save_path) and not args.revote:
+        print(f"  ✓ {sql_id} already completed, skipping")
         return
     
     if args.overwrite_unfinished:
@@ -269,13 +281,13 @@ def main(args):
     
     # 显示统计信息
     stats = loader.get_statistics()
-    print(f"\n数据集统计:")
+    print(f"  数据集统计:")
     print(f"  总问题数: {stats['total_examples']}")
     print(f"  复杂度分布: {stats['complexity_distribution']}")
     print(f"  涉及表数: {stats['total_unique_tables']}")
     
     # 加载Schema
-    print(f"\nLoading schema from {args.schema_path}...")
+    print(f"Loading schema from {args.schema_path}...")
     global schema_parser
     schema_parser = SchemaParser(args.schema_path)
     print(f"  数据库: {schema_parser.db_id}")
@@ -290,12 +302,12 @@ def main(args):
             k: v for k, v in examples_dict.items() 
             if v.get('复杂度') == args.filter_complexity
         }
-        print(f"\n过滤复杂度为 '{args.filter_complexity}' 的问题: {len(examples_dict)} 个")
+        print(f"过滤复杂度为 '{args.filter_complexity}' 的问题: {len(examples_dict)} 个")
     
     # 限制问题数量（用于测试）
     if args.max_questions:
         examples_dict = dict(list(examples_dict.items())[:args.max_questions])
-        print(f"\n限制处理前 {args.max_questions} 个问题")
+        print(f"限制处理前 {args.max_questions} 个问题")
     
     # 并行处理
     print(f"\n开始处理（使用 {args.num_workers} 个worker）...\n")
@@ -304,7 +316,13 @@ def main(args):
             executor.submit(process_question, sql_id, example, schema_parser, args)
             for sql_id, example in examples_dict.items()
         ]
-        list(concurrent.futures.as_completed(futures))
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()  # 获取结果，如果有异常会在这里抛出
+            except Exception as e:
+                print(f"[ERROR] 处理失败: {e}")
+                import traceback
+                traceback.print_exc()
     
     print("\n✓ 所有问题处理完成！")
 
@@ -320,13 +338,8 @@ if __name__ == '__main__':
                        default="E:/Project/track3_2/M-schema/final_algorithm_competition.txt",
                        help="Schema文件路径")
     
-    # StarRocks数据库配置
-    parser.add_argument('--db_host', type=str, default="localhost", help="StarRocks主机")
-    parser.add_argument('--db_port', type=int, default=9030, help="StarRocks端口")
-    parser.add_argument('--db_user', type=str, default="root", help="数据库用户名")
-    parser.add_argument('--db_password', type=str, default="", help="数据库密码")
-    parser.add_argument('--db_name', type=str, default="final_algorithm_competition", 
-                       help="数据库名")
+    # 注意: 数据库配置现在从.env文件中读取
+    # DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
     
     # 输出配置
     parser.add_argument('--output_path', type=str, default="output/starrocks-log",
@@ -380,6 +393,12 @@ if __name__ == '__main__':
                        help="按复杂度过滤")
     parser.add_argument('--max_questions', type=int, default=None,
                        help="限制处理的问题数量（用于测试）")
+    
+    # 额外配置
+    parser.add_argument('--omnisql_format_pth', type=str, default=None,
+                       help="OmniSQL格式路径（可选）")
+    parser.add_argument('--gold_result_path', type=str, default=None,
+                       help="金标准结果路径（可选）")
     
     args = parser.parse_args()
     

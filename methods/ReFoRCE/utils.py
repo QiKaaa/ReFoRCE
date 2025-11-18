@@ -170,8 +170,10 @@ def get_api_name(sql_data):
         return "sqlite"
     elif sql_data.startswith("bq") or sql_data.startswith("ga"):
         return "bigquery"
+    elif sql_data.startswith("sql"):  # StarRocks/MySQL格式 (sql_1, sql_2, etc.)
+        return "starrocks"
     else:
-        raise NotImplementedError("Invalid file name.")
+        raise NotImplementedError(f"Invalid file name: {sql_data}")
 
 def remove_digits(s):
     return re.sub(r'\d', '', s)

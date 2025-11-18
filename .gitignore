@@ -2,6 +2,11 @@
 **/snowflake_credential.json
 **/bigquery_credential.json
 
+# API Keys and environment files
+.env
+set_env.ps1
+config.json
+
 # DB
 spider2-lite/resource/databases/spider2-localdb
 data/BIRD/dev_databases

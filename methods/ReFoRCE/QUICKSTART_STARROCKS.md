@@ -19,8 +19,8 @@ cd E:\Project\track3_2\ReFoRCE\methods\ReFoRCE
 # 安装uv（如果还没有）
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# 创建虚拟环境并安装依赖
-uv venv --python 3.10
+# 创建虚拟环境并安装依赖（使用 Python 3.12）
+uv venv --python 3.12
 .\.venv\Scripts\Activate.ps1
 uv pip install -r requirements_starrocks.txt
 ```

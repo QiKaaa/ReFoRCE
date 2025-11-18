@@ -8,11 +8,13 @@ openai==1.56.0
 pandas==2.2.3
 spacy==3.8.4
 sqlglot==26.16.4
+sqlparse
 tqdm==4.67.1
 
 # StarRocks特定依赖
-sqlalchemy==2.0.23
-starrocks==1.0.2
+sqlalchemy
+starrocks
+pymysql
 
-# 可选：如果使用MySQL连接器
-# pymysql==1.1.0
+# 环境配置
+python-dotenv

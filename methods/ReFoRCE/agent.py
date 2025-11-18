@@ -1,5 +1,10 @@
 from utils import hard_cut, get_values_from_table, get_api_name, filter_bijection_like_dict, compare_pandas_table, is_valid_result, get_sqlite_path, split_sql
-from sql import SqlEnv
+# 条件导入：支持 StarRocks 和原始 SQL 环境
+try:
+    from sql import SqlEnv
+except ImportError:
+    # 如果原始 sql.py 导入失败（缺少 BigQuery 等依赖），使用 StarRocks
+    from sql_starrocks import SqlEnvStarRocks as SqlEnv
 import pandas as pd
 from io import StringIO
 import os
@@ -9,7 +14,14 @@ from prompt import Prompts
 from typing import Type
 from chat import GPTChat
 import sys
-csv.field_size_limit(sys.maxsize)
+
+# 设置 CSV 字段大小限制（Windows 兼容）
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    # Windows 上使用较小的值
+    max_int = int(2**31 - 1)
+    csv.field_size_limit(max_int)
 
 class REFORCE:
     def __init__(self, db_path, sql_data, search_directory, prompt_class: Type[Prompts], sql_env: Type[SqlEnv]=None, chat_session_pre=None, chat_session=None, log_save_path=None, db_id=None, task=None):
