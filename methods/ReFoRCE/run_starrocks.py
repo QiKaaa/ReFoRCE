@@ -38,7 +38,8 @@ def execute_single_question(
     schema_parser, args, 
     csv_save_path, log_save_path, sql_save_path, 
     search_directory, format_csv,
-    schema_linker=None, use_schema_linking=False
+    schema_linker=None, use_schema_linking=False,
+    complexity='unknown'
 ):
     """
     执行单个问题
@@ -57,6 +58,7 @@ def execute_single_question(
         format_csv: 格式化CSV
         schema_linker: Schema Linking器（可选）
         use_schema_linking: 是否使用Schema Linking
+        complexity: 问题复杂度（简单/中等/复杂）
     """
     
     # 如果结果已存在且不允许覆盖，则跳过
@@ -116,7 +118,20 @@ def execute_single_question(
     chat_session_ex = None
     chat_session = None
     
+    # 判断是否需要列探索
+    # 逻辑：do_column_exploration为False时不开启
+    #      do_column_exploration为True时，根据复杂度判断：
+    #        - 简单：不开启列探索
+    #        - 中等/复杂：开启列探索
+    should_do_column_exploration = False
     if args.do_column_exploration:
+        if complexity in ['中等', '复杂']:
+            should_do_column_exploration = True
+            logger.info(f"[Column Exploration] Enabled for complexity: {complexity}")
+        else:
+            logger.info(f"[Column Exploration] Skipped for complexity: {complexity} (only enabled for 中等/复杂)")
+    
+    if should_do_column_exploration:
         chat_session_ex = GPTChat(
             args.azure, 
             args.column_exploration_model, 
@@ -155,7 +170,7 @@ def execute_single_question(
     
     # 列探索
     pre_info, response_pre_txt = None, None
-    if args.do_column_exploration:
+    if should_do_column_exploration:
         pre_info, response_pre_txt, max_try = agent.exploration(
             question, table_struct, table_info, logger
         )
@@ -196,6 +211,8 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
     table_list = example.get('table_list', [])
     knowledge = example.get('knowledge', '')
     complexity = example.get('复杂度', 'unknown')
+    golden_sql = example.get('sql', None)  # 获取金标准SQL
+    is_golden = example.get('golden_sql', False)  # 是否为金标准题目
     
     # 创建输出目录
     search_directory = os.path.join(args.output_path, sql_id)
@@ -260,7 +277,8 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         schema_parser, args,
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
-                        None, False  # 不使用schema linking
+                        None, False,  # 不使用schema linking
+                        complexity  # 传递复杂度参数
                     )
                 )
                 threads.append(thread)
@@ -280,7 +298,8 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         schema_parser, args,
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
-                        schema_linker, True  # 使用schema linking
+                        schema_linker, True,  # 使用schema linking
+                        complexity  # 传递复杂度参数
                     )
                 )
                 threads.append(thread)
@@ -301,7 +320,8 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         schema_parser, args,
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
-                        None, False
+                        None, False,
+                        complexity  # 传递复杂度参数
                     )
                 )
                 threads.append(thread)
@@ -340,11 +360,156 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             agent_format.sql_save_name,
             search_directory, format_csv,
             schema_linker if args.use_schema_linking else None,
-            args.use_schema_linking if hasattr(args, 'use_schema_linking') else False
+            args.use_schema_linking if hasattr(args, 'use_schema_linking') else False,
+            complexity  # 传递复杂度参数
         )
     
     elapsed = int((time.time() - start_time) // 60)
     print(f"✓ {sql_id} completed in {elapsed} min")
+    
+    # 如果有金标准SQL，进行对比评估
+    if args.enable_golden_evaluation and is_golden and golden_sql:
+        try:
+            evaluate_with_golden_sql(
+                sql_id, 
+                search_directory, 
+                golden_sql, 
+                args
+            )
+        except Exception as e:
+            print(f"⚠️ {sql_id}: Golden SQL evaluation failed - {e}")
+
+
+def evaluate_with_golden_sql(sql_id, search_directory, golden_sql, args):
+    """
+    使用金标准SQL评估生成的结果
+    
+    Args:
+        sql_id: SQL问题ID
+        search_directory: 输出目录
+        golden_sql: 金标准SQL
+        args: 命令行参数
+    """
+    import pandas as pd
+    from io import StringIO
+    
+    print(f"{'='*60}")
+    print(f"📊 Golden SQL Evaluation for {sql_id}")
+    print(f"{'='*60}")
+    
+    # 1. 执行金标准SQL
+    golden_result_path = os.path.join(search_directory, "golden_result.csv")
+    golden_sql_path = os.path.join(search_directory, "golden.sql")
+    
+    # 保存金标准SQL
+    with open(golden_sql_path, 'w', encoding='utf-8') as f:
+        f.write(golden_sql)
+    
+    print(f"📝 Executing Golden SQL...")
+    sql_env = SqlEnvStarRocks(
+        host=DB_CONFIG['host'],
+        port=DB_CONFIG['port'],
+        user=DB_CONFIG['user'],
+        password=DB_CONFIG['password'],
+        database=DB_CONFIG['database']
+    )
+    
+    result = sql_env.execute_sql_api(
+        golden_sql, 
+        sql_id, 
+        golden_result_path,
+        api="starrocks"
+    )
+    
+    if result != "0":
+        print(f"❌ Golden SQL execution failed: {result}")
+        sql_env.close_db()
+        return
+    
+    print(f"✅ Golden SQL executed successfully")
+    
+    # 读取金标准结果
+    with open(golden_result_path, 'r', encoding='utf-8') as f:
+        golden_df = pd.read_csv(StringIO(f.read())).fillna("")
+    
+    print(f"   Rows: {len(golden_df)}, Columns: {len(golden_df.columns)}")
+    
+    # 2. 读取生成的结果
+    generated_result_path = os.path.join(search_directory, "result.csv")
+    
+    if not os.path.exists(generated_result_path):
+        print(f"⚠️ Generated result not found: {generated_result_path}")
+        sql_env.close_db()
+        return
+    
+    print(f"📝 Comparing with generated result...")
+    with open(generated_result_path, 'r', encoding='utf-8') as f:
+        generated_df = pd.read_csv(StringIO(f.read())).fillna("")
+    
+    print(f"   Rows: {len(generated_df)}, Columns: {len(generated_df.columns)}")
+    
+    # 3. 对比结果
+    from utils import compare_pandas_table
+    
+    is_match = compare_pandas_table(golden_df, generated_df, ignore_order=True)
+    shape_match = golden_df.shape == generated_df.shape
+    
+    # 4. 生成评估报告
+    evaluation_report = os.path.join(search_directory, "evaluation_report.txt")
+    
+    with open(evaluation_report, 'w', encoding='utf-8') as f:
+        f.write(f"Golden SQL Evaluation Report")
+        f.write(f"="*60 + "")
+        f.write(f"SQL ID: {sql_id}")
+        f.write(f"Evaluation Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        f.write(f"Golden Result:")
+        f.write(f"  Rows: {len(golden_df)}")
+        f.write(f"  Columns: {len(golden_df.columns)}")
+        f.write(f"  Column Names: {list(golden_df.columns)}")
+        
+        f.write(f"Generated Result:")
+        f.write(f"  Rows: {len(generated_df)}")
+        f.write(f"  Columns: {len(generated_df.columns)}")
+        f.write(f"  Column Names: {list(generated_df.columns)}")
+        
+        f.write(f"Comparison:")
+        f.write(f"  Shape Match: {'✅ Yes' if shape_match else '❌ No'}")
+        f.write(f"  Content Match (ignore order): {'✅ Yes' if is_match else '❌ No'}")
+        
+        if is_match and shape_match:
+            f.write(f"🎉 Result: PASS - Results are identical!")
+            print(f"🎉 PASS - Results are identical!")
+        elif shape_match:
+            f.write(f"⚠️ Result: PARTIAL - Shape matches but content differs")
+            print(f"⚠️ PARTIAL - Shape matches but content differs")
+        else:
+            f.write(f"❌ Result: FAIL - Results differ significantly")
+            print(f"❌ FAIL - Results differ")
+            
+            # 显示详细差异
+            f.write(f"Detailed Differences:")
+            if len(golden_df) != len(generated_df):
+                f.write(f"  Row count: Golden={len(golden_df)}, Generated={len(generated_df)}")
+            if len(golden_df.columns) != len(generated_df.columns):
+                f.write(f"  Column count: Golden={len(golden_df.columns)}, Generated={len(generated_df.columns)}")
+            if list(golden_df.columns) != list(generated_df.columns):
+                f.write(f"  Column names differ")
+                f.write(f"    Golden: {list(golden_df.columns)}")
+                f.write(f"    Generated: {list(generated_df.columns)}")
+        
+        # 显示前几行数据
+        f.write(f"{'='*60}")
+        f.write(f"Golden Result Preview (first 5 rows):")
+        f.write(golden_df.head().to_string() + "")
+        
+        f.write(f"Generated Result Preview (first 5 rows):")
+        f.write(generated_df.head().to_string() + "")
+    
+    print(f"📄 Evaluation report saved to: {evaluation_report}")
+    print(f"{'='*60}")
+    
+    sql_env.close_db()
 
 
 def main(args):
@@ -408,6 +573,108 @@ def main(args):
                 traceback.print_exc()
     
     print("✓ 所有问题处理完成！")
+    
+    # 如果启用了金标准评估，生成总结报告
+    if args.enable_golden_evaluation:
+        generate_evaluation_summary(args.output_path, examples_dict)
+
+
+def generate_evaluation_summary(output_path, examples_dict):
+    """生成金标准评估总结报告"""
+    print(f"{'='*60}")
+    print(f"📊 Generating Golden SQL Evaluation Summary")
+    print(f"{'='*60}")
+    
+    results = {
+        'pass': [],
+        'partial': [],
+        'fail': [],
+        'not_evaluated': []
+    }
+    
+    # 遍历所有题目，读取评估报告
+    for sql_id, example in examples_dict.items():
+        is_golden = example.get('golden_sql', False)
+        
+        if not is_golden:
+            continue
+        
+        eval_report_path = os.path.join(output_path, sql_id, "evaluation_report.txt")
+        
+        if not os.path.exists(eval_report_path):
+            results['not_evaluated'].append(sql_id)
+            continue
+        
+        # 读取评估结果
+        with open(eval_report_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        if "Result: PASS" in content:
+            results['pass'].append(sql_id)
+        elif "Result: PARTIAL" in content:
+            results['partial'].append(sql_id)
+        elif "Result: FAIL" in content:
+            results['fail'].append(sql_id)
+        else:
+            results['not_evaluated'].append(sql_id)
+    
+    # 统计
+    total_golden = len([e for e in examples_dict.values() if e.get('golden_sql', False)])
+    total_evaluated = len(results['pass']) + len(results['partial']) + len(results['fail'])
+    
+    if total_evaluated == 0:
+        print("⚠️ 没有找到任何评估结果")
+        return
+    
+    # 生成总结报告
+    summary_path = os.path.join(output_path, "golden_evaluation_summary.txt")
+    
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write(f"Golden SQL Evaluation Summary")
+        f.write(f"{'='*60}")
+        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        f.write(f"Total Golden SQL Questions: {total_golden}")
+        f.write(f"Evaluated: {total_evaluated}")
+        f.write(f"Not Evaluated: {len(results['not_evaluated'])}")
+        
+        f.write(f"Results Breakdown:")
+        f.write(f"  ✅ PASS (Identical):   {len(results['pass'])} ({len(results['pass'])/total_evaluated*100:.1f}% of evaluated)")
+        f.write(f"  ⚠️  PARTIAL (Shape OK): {len(results['partial'])} ({len(results['partial'])/total_evaluated*100:.1f}% of evaluated)")
+        f.write(f"  ❌ FAIL (Different):   {len(results['fail'])} ({len(results['fail'])/total_evaluated*100:.1f}% of evaluated)")
+        
+        accuracy = len(results['pass']) / total_evaluated * 100
+        f.write(f"Accuracy (PASS only): {accuracy:.2f}%")
+        
+        f.write(f"PASSED Questions ({len(results['pass'])}):")
+        for sql_id in results['pass']:
+            f.write(f"  ✅ {sql_id}")
+        
+        f.write(f"PARTIAL Questions ({len(results['partial'])}):")
+        for sql_id in results['partial']:
+            f.write(f"  ⚠️  {sql_id}")
+        
+        f.write(f"FAILED Questions ({len(results['fail'])}):")
+        for sql_id in results['fail']:
+            f.write(f"  ❌ {sql_id}")
+        
+        if results['not_evaluated']:
+            f.write(f"Not Evaluated ({len(results['not_evaluated'])}):")
+            for sql_id in results['not_evaluated']:
+                f.write(f"  ⏭️  {sql_id}")
+    
+    # 打印到控制台
+    print(f"📈 Evaluation Summary:")
+    print(f"   Total Golden Questions: {total_golden}")
+    print(f"   Evaluated: {total_evaluated}")
+    print(f"   ✅ PASS: {len(results['pass'])} ({len(results['pass'])/total_evaluated*100:.1f}%)")
+    print(f"   ⚠️  PARTIAL: {len(results['partial'])} ({len(results['partial'])/total_evaluated*100:.1f}%)")
+    print(f"   ❌ FAIL: {len(results['fail'])} ({len(results['fail'])/total_evaluated*100:.1f}%)")
+    accuracy = len(results['pass']) / total_evaluated * 100
+    print(f"   📊 Accuracy: {accuracy:.2f}%")
+    
+    print(f"📄 Summary report saved to: {summary_path}")
+    print(f"{'='*60}")
 
 
 if __name__ == '__main__':
@@ -430,11 +697,11 @@ if __name__ == '__main__':
     
     # 模型配置
     parser.add_argument('--azure', action="store_true", help="使用Azure OpenAI")
-    parser.add_argument('--generation_model', type=str, default="gpt-4o",
+    parser.add_argument('--generation_model', type=str, default="deepseek-chat",
                        help="生成模型")
-    parser.add_argument('--column_exploration_model', type=str, default="gpt-4o",
+    parser.add_argument('--column_exploration_model', type=str, default="deepseek-chat",
                        help="列探索模型")
-    parser.add_argument('--format_model', type=str, default="gpt-4o",
+    parser.add_argument('--format_model', type=str, default="deepseek-chat",
                        help="格式化模型")
     parser.add_argument('--model_vote', type=str, default=None,
                        help="投票模型")
@@ -443,7 +710,7 @@ if __name__ == '__main__':
     parser.add_argument('--do_format_restriction', action="store_true",
                        help="启用格式限制")
     parser.add_argument('--do_column_exploration', action="store_true",
-                       help="启用列探索")
+                       help="启用列探索（根据复杂度自动判断：简单题不开启，中等/复杂题开启）")
     parser.add_argument('--do_self_refinement', action="store_true",
                        help="启用自我精化")
     parser.add_argument('--do_self_consistency', action="store_true",
@@ -461,7 +728,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter', type=int, default=5, help="最大迭代次数")
     parser.add_argument('--temperature', type=float, default=1.0, help="采样温度")
     parser.add_argument('--num_votes', type=int, default=3, help="投票次数")
-    parser.add_argument('--num_workers', type=int, default=4, help="并行worker数量")
+    parser.add_argument('--num_workers', type=int, default=10, help="并行worker数量")
     parser.add_argument('--early_stop', action="store_true", help="早停")
     
     # 其他选项
@@ -488,6 +755,8 @@ if __name__ == '__main__':
                        help="OmniSQL格式路径（可选）")
     parser.add_argument('--gold_result_path', type=str, default=None,
                        help="金标准结果路径（可选）")
+    parser.add_argument('--enable_golden_evaluation', action='store_true',
+                       help="启用金标准SQL评估（自动对比有golden_sql=true的题目）")
     
     args = parser.parse_args()
     

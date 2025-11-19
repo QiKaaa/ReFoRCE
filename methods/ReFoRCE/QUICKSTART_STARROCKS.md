@@ -208,6 +208,9 @@ python run_starrocks.py `
   --do_self_refinement `
   --temperature 0.5
 ```
+**注意**: `--do_column_exploration` 会根据题目复杂度自动决定是否执行列探索：
+- 简单题：不执行（节省时间和成本）
+- 中等/复杂题：执行（提高准确率）
 
 ### 高精度模式 (Schema Linking + 投票)
 ```powershell

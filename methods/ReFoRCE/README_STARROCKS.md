@@ -212,7 +212,7 @@ python run_starrocks.py \
 ### 功能开关
 | 参数 | 说明 |
 |------|------|
-| `--do_column_exploration` | 启用列探索 |
+| `--do_column_exploration` | 启用列探索（根据复杂度自适应：简单题不开启，中等/复杂题开启） |
 | `--do_self_refinement` | 启用自我精化 |
 | `--do_self_consistency` | 启用自我一致性检查 |
 | `--do_vote` | 启用投票机制 |
