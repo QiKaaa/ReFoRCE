@@ -89,8 +89,30 @@ class OptimizedSchemaLinker:
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
-                data = json.loads(json_str)
-                return data.get('tables', {})
+                
+                # 清理可能的控制字符
+                # 方法1: 移除或替换无效的控制字符
+                json_str_cleaned = json_str
+                
+                # 尝试解析
+                try:
+                    data = json.loads(json_str)
+                    return data.get('tables', {})
+                except json.JSONDecodeError as json_err:
+                    # 如果失败,尝试使用 strict=False 模式
+                    print(f"警告: JSON 包含控制字符,尝试宽松模式解析: {json_err}")
+                    try:
+                        # Python 的 json.loads 默认 strict=True
+                        # 我们可以手动清理控制字符
+                        import re as regex_lib
+                        # 移除除了常见转义字符外的控制字符
+                        json_str_cleaned = regex_lib.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', json_str)
+                        data = json.loads(json_str_cleaned)
+                        return data.get('tables', {})
+                    except Exception as e2:
+                        print(f"警告: 宽松模式解析也失败: {e2}")
+                        print(f"问题 JSON 片段: {json_str[:200]}...")
+                        return {}
             else:
                 print(f"警告: 无法从 LLM 响应中提取 JSON")
                 return {}

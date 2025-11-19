@@ -191,8 +191,10 @@ class REFORCE:
 
     def self_refine(self, args, logger, question, format_csv, table_struct, table_info, response_pre_txt, pre_info, csv_save_path, sql_save_path, task=None):
         itercount = 0
-        results_values = []
-        results_tables = []
+        # ===== 已注释:不再需要稳定性验证所需的变量 =====
+        # results_values = []
+        # results_tables = []
+        # ===== 注释结束 =====
 
         # ✨ 使用 System/User 分离模式
         # System Prompt (只设置一次，可复用)
@@ -261,29 +263,67 @@ class REFORCE:
                 csv_buffer = StringIO(csv_data_str)
                 df_csv = pd.read_csv(csv_buffer).fillna("")
 
-                nested_val = [(item) for i, row in enumerate(df_csv.values.tolist()) for j, item in enumerate(row) if isinstance(item, str) and '\n' in item in item]
-                df_csv_copy = df_csv.copy()
-                for col in df_csv.select_dtypes(include=['float']):
-                    df_csv_copy[col] = df_csv[col].round(2)
-                sort_col = df_csv_copy.columns[0]
-                df_csv_copy_sorted = df_csv_copy[sort_col].astype(str)
-                csv_data_str_round2 = df_csv_copy_sorted.to_string()
+                # ===== 原有代码(已注释):使用 results_values 进行稳定性验证 =====
+                # nested_val = [(item) for i, row in enumerate(df_csv.values.tolist()) for j, item in enumerate(row) if isinstance(item, str) and '\n' in item in item]
+                # df_csv_copy = df_csv.copy()
+                # for col in df_csv.select_dtypes(include=['float']):
+                #     df_csv_copy[col] = df_csv[col].round(2)
+                # sort_col = df_csv_copy.columns[0]
+                # df_csv_copy_sorted = df_csv_copy[sort_col].astype(str)
+                # csv_data_str_round2 = df_csv_copy_sorted.to_string()
+                # df_csv_str = df_csv.astype(str)
+                # if get_values_from_table(csv_data_str_round2) not in results_values:
+                #     if nested_val:
+                #         self_consistency_prompt += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
+                #     elif not ((df_csv_str == "0") | (df_csv_str == "")).all().any():
+                #             results_values.append(get_values_from_table(csv_data_str_round2))
+                #             results_tables.append(csv_data_str)
+                #     else:
+                #         empty_columns = df_csv_str.columns[((df_csv_str == "0") | (df_csv_str == "")).all()].to_list()
+                #         self_consistency_prompt += f"Empty results in Column {empty_columns}. Please correct them.\n"
+                # else:
+                #     # self-consistency
+                #     logger.info(f"[Consistent results]\n{hard_cut(csv_data_str, 500)}\n[Consistent results]")
+                #     with open(sql_save_path, "w") as f:
+                #         f.write(response)
+                #     break
+                # ===== 原有代码结束 =====
+
+                # ===== 新逻辑:仅过滤错误结果,不验证稳定性 =====
+                # 修改目的:去除 results_values 稳定性检查,只要结果无明显错误就保存SQL并终止迭代
+                
+                # 1. 检查嵌套值错误(字符串中包含换行符)
+                nested_val = [(item) for i, row in enumerate(df_csv.values.tolist()) 
+                              for j, item in enumerate(row) 
+                              if isinstance(item, str) and '\n' in item]
+                
+                # 2. 检查空列错误
                 df_csv_str = df_csv.astype(str)
-                if get_values_from_table(csv_data_str_round2) not in results_values:
-                    if nested_val:
-                        self_consistency_prompt += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
-                    elif not ((df_csv_str == "0") | (df_csv_str == "")).all().any():
-                            results_values.append(get_values_from_table(csv_data_str_round2))
-                            results_tables.append(csv_data_str)
-                    else:
-                        empty_columns = df_csv_str.columns[((df_csv_str == "0") | (df_csv_str == "")).all()].to_list()
-                        self_consistency_prompt += f"Empty results in Column {empty_columns}. Please correct them.\n"
-                else:
-                    # self-consistency
-                    logger.info(f"[Consistent results]\n{hard_cut(csv_data_str, 500)}\n[Consistent results]")
+                has_empty_columns = ((df_csv_str == "0") | (df_csv_str == "")).all().any()
+                
+                # 3. 判断是否有错误需要修正
+                has_errors = False
+                
+                if nested_val:
+                    # 存在嵌套值,需要修正
+                    self_consistency_prompt += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\\nA,\\n B\\n]' to 'A, B'.\\n"
+                    has_errors = True
+                
+                if has_empty_columns:
+                    # 存在空列,需要修正
+                    empty_columns = df_csv_str.columns[((df_csv_str == "0") | (df_csv_str == "")).all()].to_list()
+                    self_consistency_prompt += f"Empty results in Column {empty_columns}. Please correct them.\\n"
+                    has_errors = True
+                
+                # 4. 如果没有错误,直接保存SQL并终止迭代
+                if not has_errors:
+                    logger.info(f"[Valid results - no errors detected]\\n{hard_cut(csv_data_str, 500)}\\n[Valid results]")
                     with open(sql_save_path, "w") as f:
                         f.write(response)
                     break
+                # 5. 如果有错误,继续迭代让LLM修正
+                # (self_consistency_prompt 已在上面添加错误提示)
+                # ===== 新逻辑结束 =====
                 
                 if any(keyword in response for keyword in self.prompt_class.get_condition_onmit_tables()):
                     self_consistency_prompt += self.prompt_class.get_prompt_dialect_list_all_tables(table_struct, self.api)
@@ -326,6 +366,11 @@ class REFORCE:
                 f.write(response)
 
     def model_vote(self, result, sql_paths, search_directory, args, table_info, task, knowledge=None):
+        # 检查 result 是否为空
+        if not result or not result.values():
+            print(f"[WARNING] {search_directory}: No valid results for voting, skipping model_vote")
+            return
+        
         chat_session = GPTChat(args.azure, args.model_vote)
         max_value = max(result.values())
         max_dict = {k: v for k, v in result.items() if v == max_value}
@@ -377,7 +422,7 @@ class REFORCE:
                 f.write(chat_session.messages[-1]['content'])
         sql_env.close_db()
 
-    def vote_result(self, search_directory, args, sql_paths, table_info, task):
+    def vote_result(self, search_directory, args, sql_paths, table_info, task, knowledge=None):
         # filter answer
         result = {}
         result_name = {}
@@ -409,6 +454,18 @@ class REFORCE:
                 print(f"{search_directory} empty results")
                 return
             elif args.model_vote:
+                # 检查 result_all 是否有有效数据
+                if not result_all:
+                    print(f"[WARNING] {search_directory}: result_all is empty, cannot perform model_vote")
+                    # 如果有all_values但result_all为空,尝试使用final_choose逻辑
+                    if all_values and args.final_choose:
+                        csv_pth = all_values[0]
+                        os.makedirs(os.path.dirname(self.complete_sql_save_path), exist_ok=True)
+                        shutil.copy2(csv_pth.replace(".csv", ".sql"), self.complete_sql_save_path)
+                        shutil.copy2(csv_pth, self.complete_csv_save_path) 
+                        shutil.copy2(csv_pth.replace("result.csv", "log.log"), self.complete_log_save_path)
+                    return
+                
                 assert all(v == 0 for k, v in result_all.items()), result
                 result_all = {k: v + 1 for k, v in result_all.items()}
                 # print(result_all)
@@ -425,9 +482,19 @@ class REFORCE:
             return
 
         sorted_dict = dict(sorted(result.items(), key=lambda item: item[1], reverse=True))
+        
+        # 再次检查以防万一
+        if not sorted_dict:
+            print(f"[WARNING] {search_directory}: sorted_dict is empty after filtering")
+            return
+        
         first_key = next(iter(sorted_dict))
 
         vote_counts = list(sorted_dict.values())
+        if not vote_counts:
+            print(f"[WARNING] {search_directory}: vote_counts is empty")
+            return
+        
         max_vote = max(vote_counts)
         num_with_max_vote = vote_counts.count(max_vote)
         has_tie = num_with_max_vote > (max_vote + 1)

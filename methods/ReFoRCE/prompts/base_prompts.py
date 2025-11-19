@@ -332,6 +332,38 @@ Please analyze the error and provide the corrected SQL query. Include your think
         
         return user_prompt
     
+    def get_exploration_refine_prompt(self, sql: str, corrected_sql: str, sqls: list, res: str) -> str:
+        """
+        探索阶段批量修正其他SQL的 User Prompt
+        当一个SQL被修正后，用于指导修正其他类似的SQL
+        
+        Args:
+            sql: 原始错误的SQL
+            corrected_sql: 修正后的SQL
+            sqls: 需要检查和修正的其他SQL列表
+            res: 修正后SQL的执行结果
+        """
+        user_prompt = f"""```sql
+{sql}
+``` 
+was corrected to:
+```sql
+{corrected_sql}
+```
+
+And the result is:
+{res}
+
+Please correct other sqls based on results if they have similar errors. Otherwise don't modify the SQL. 
+
+SQLs to check: {sqls}
+
+For each SQL, answer in ```sql
+--Description: 
+``` format."""
+        
+        return user_prompt
+    
     # ==================== 内部辅助方法 ====================
     
     def _get_dialect_basic_rules(self, api: str) -> str:

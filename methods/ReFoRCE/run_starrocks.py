@@ -578,9 +578,83 @@ def main(args):
     
     print("✓ 所有问题处理完成！")
     
+    # 生成 final_dataset.json
+    generate_final_dataset(args.output_path, examples_dict, args.final_dataset_path)
+    
     # 如果启用了金标准评估，生成总结报告
     if args.enable_golden_evaluation:
         generate_evaluation_summary(args.output_path, examples_dict)
+
+
+def generate_final_dataset(output_path, examples_dict, final_dataset_path=None):
+    """
+    生成 final_dataset.json 文件
+    
+    Args:
+        output_path: 输出目录路径
+        examples_dict: 问题字典
+        final_dataset_path: final_dataset.json 的输出路径（默认: E:/Project/track3_2/final_dataset.json）
+    """
+    import json
+    
+    # 使用默认路径（如果未指定）
+    if final_dataset_path is None:
+        final_dataset_path = "E:/Project/track3_2/final_dataset.json"
+    
+    print(f"{'='*60}")
+    print(f"📝 生成 final_dataset.json")
+    print(f"{'='*60}")
+    
+    final_results = []
+    
+    for sql_id, example in examples_dict.items():
+        result_sql_path = os.path.join(output_path, sql_id, "result.sql")
+        
+        # 检查是否有生成的SQL
+        if os.path.exists(result_sql_path):
+            try:
+                with open(result_sql_path, 'r', encoding='utf-8') as f:
+                    generated_sql = f.read().strip()
+                
+                # 添加到结果列表
+                final_results.append({
+                    "sql_id": sql_id,
+                    "sql": generated_sql
+                })
+                
+                print(f"  ✓ {sql_id}: SQL已收集")
+            except Exception as e:
+                print(f"  ✗ {sql_id}: 读取SQL失败 - {e}")
+        else:
+            print(f"  ⚠ {sql_id}: 未找到生成的SQL")
+    
+    # 确保输出目录存在
+    final_dataset_dir = os.path.dirname(final_dataset_path)
+    if final_dataset_dir and not os.path.exists(final_dataset_dir):
+        os.makedirs(final_dataset_dir, exist_ok=True)
+    
+    try:
+        with open(final_dataset_path, 'w', encoding='utf-8') as f:
+            json.dump(final_results, f, ensure_ascii=False, indent=2)
+        
+        print(f"\n✓ 成功写入 {len(final_results)} 条结果到: {final_dataset_path}")
+        print(f"  总问题数: {len(examples_dict)}")
+        print(f"  成功生成: {len(final_results)}")
+        print(f"  失败数量: {len(examples_dict) - len(final_results)}")
+    except Exception as e:
+        print(f"\n✗ 写入 final_dataset.json 失败: {e}")
+        import traceback
+        traceback.print_exc()
+    
+        print(f"{'='*60}")
+        print(f"  成功生成: {len(final_results)}")
+        print(f"  失败数量: {len(examples_dict) - len(final_results)}")
+    except Exception as e:
+        print(f"✗ 写入 final_dataset.json 失败: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print(f"{'='*60}")
 
 
 def generate_evaluation_summary(output_path, examples_dict):
@@ -698,6 +772,9 @@ if __name__ == '__main__':
     # 输出配置
     parser.add_argument('--output_path', type=str, default="output/starrocks-log",
                        help="输出目录")
+    parser.add_argument('--final_dataset_path', type=str, 
+                       default="E:/Project/track3_2/final_dataset.json",
+                       help="final_dataset.json 输出路径")
     
     # 模型配置
     parser.add_argument('--azure', action="store_true", help="使用Azure OpenAI")
