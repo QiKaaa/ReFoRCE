@@ -43,7 +43,9 @@ def execute_single_question(
     csv_save_path, log_save_path, sql_save_path, 
     search_directory, format_csv,
     schema_linker=None, use_schema_linking=False,
-    complexity='unknown'
+    complexity='unknown',
+    cached_exploration_result=None,  # ✨ 新增:缓存的列探索结果
+    cached_linked_schema=None  # ✨ 新增:缓存的schema linking结果
 ):
     """
     执行单个问题
@@ -63,6 +65,8 @@ def execute_single_question(
         schema_linker: Schema Linking器（可选）
         use_schema_linking: 是否使用Schema Linking
         complexity: 问题复杂度（简单/中等/复杂）
+        cached_exploration_result: 缓存的列探索结果(pre_info, response_pre_txt) ✨
+        cached_linked_schema: 缓存的schema linking结果 ✨
     """
     
     # 如果结果已存在且不允许覆盖，则跳过
@@ -85,24 +89,29 @@ def execute_single_question(
     
     # 根据use_schema_linking决定使用哪种schema
     if use_schema_linking and schema_linker:
-        # 使用Schema Linking获取精简的Schema
-        logger.info("[Schema Linking] Generating optimized schema...")
-        
-        # 创建 chat session
-        chat_session_sl = GPTChat(
-            args.azure if hasattr(args, 'azure') else False,
-            args.generation_model,
-            temperature=0
-        )
-        
-        linked_schema = schema_linker.link_schema(
-            question=question,
-            table_list=table_list,
-            knowledge=knowledge,
-            chat_session=chat_session_sl
-        )
-        table_info = linked_schema  # 已经是 M-schema 格式的文本
-        logger.info(f"[Schema Linking] Optimized schema generated")
+        # ===== 使用缓存的Schema Linking结果（如果有）=====
+        if cached_linked_schema is not None:
+            table_info = cached_linked_schema
+            logger.info("[Schema Linking] Using cached schema")
+        else:
+            # 使用Schema Linking获取精简的Schema
+            logger.info("[Schema Linking] Generating optimized schema...")
+            
+            # 创建 chat session
+            chat_session_sl = GPTChat(
+                args.azure if hasattr(args, 'azure') else False,
+                args.generation_model,
+                temperature=0
+            )
+            
+            linked_schema = schema_linker.link_schema(
+                question=question,
+                table_list=table_list,
+                knowledge=knowledge,
+                chat_session=chat_session_sl
+            )
+            table_info = linked_schema  # 已经是 M-schema 格式的文本
+            logger.info(f"[Schema Linking] Optimized schema generated")
     else:
         # 使用完整Schema（原方式）
         table_info = schema_parser.get_tables_chunks(table_list)
@@ -172,16 +181,23 @@ def execute_single_question(
         task="starrocks"
     )
     
-    # 列探索
+    # ===== 列探索（使用缓存机制）=====
     pre_info, response_pre_txt = None, None
     if should_do_column_exploration:
-        pre_info, response_pre_txt, max_try = agent.exploration(
-            question, table_struct, table_info, logger
-        )
-        if max_try <= 0:
-            print(f"{sql_id}: Inadequate preparation, skip")
-            return
-        print(f"{sql_id}: chat_session_ex len: {chat_session_ex.get_message_len()}")
+        # 如果有缓存结果，直接使用
+        if cached_exploration_result is not None:
+            pre_info, response_pre_txt = cached_exploration_result
+            logger.info("[Column Exploration] Using cached exploration result")
+            print(f"{sql_id}: Using cached column exploration")
+        else:
+            # 没有缓存，执行列探索
+            pre_info, response_pre_txt, max_try = agent.exploration(
+                question, table_struct, table_info, logger
+            )
+            if max_try <= 0:
+                print(f"{sql_id}: Inadequate preparation, skip")
+                return
+            print(f"{sql_id}: chat_session_ex len: {chat_session_ex.get_message_len()}")
     
     csv_save_path_full = os.path.join(search_directory, csv_save_path)
     sql_save_path_full = os.path.join(search_directory, sql_save_path)
@@ -248,7 +264,94 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
     if not os.path.exists(search_directory):
         os.makedirs(search_directory)
     
-    # 格式限制（可选）
+    # ===== ✨ 预先执行一次列探索（如果需要）=====
+    # 修改目的：避免投票模式下重复执行列探索，提高效率
+    cached_exploration_result = None
+    should_do_column_exploration = False
+    
+    if args.do_column_exploration and complexity in ['中等', '复杂']:
+        should_do_column_exploration = True
+        print(f"[{sql_id}] Pre-executing column exploration (complexity: {complexity})...")
+        
+        # 创建临时的chat session用于列探索
+        chat_session_ex_temp = GPTChat(
+            args.azure, 
+            args.column_exploration_model, 
+            temperature=args.temperature
+        )
+        
+        # 获取table_info（用于列探索）
+        table_info_for_exploration = schema_parser.get_tables_chunks(table_list)
+        if knowledge:
+            table_info_for_exploration += f"Domain Knowledge:{knowledge}"
+        
+        table_struct = f"Available tables: {', '.join(table_list)}"
+        
+        # 创建临时Agent执行列探索
+        sql_env_temp = SqlEnvStarRocks(
+            host=DB_CONFIG['host'],
+            port=DB_CONFIG['port'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database=DB_CONFIG['database']
+        )
+        
+        agent_temp = REFORCE(
+            db_path=None,
+            sql_data=sql_id,
+            search_directory=search_directory,
+            prompt_class=prompt_all,
+            sql_env=sql_env_temp,
+            chat_session_pre=chat_session_ex_temp,
+            chat_session=None,
+            log_save_path=sql_id + '/temp_exploration.log',
+            db_id=DB_CONFIG['database'],
+            task="starrocks"
+        )
+        
+        # 执行列探索（只执行一次）
+        logger_temp = initialize_logger(os.path.join(search_directory, 'temp_exploration.log'))
+        pre_info, response_pre_txt, max_try = agent_temp.exploration(
+            question, table_struct, table_info_for_exploration, logger_temp
+        )
+        
+        if max_try <= 0:
+            print(f"{sql_id}: Column exploration failed, skip")
+            sql_env_temp.close_db()
+            return
+        
+        # 缓存结果
+        cached_exploration_result = (pre_info, response_pre_txt)
+        sql_env_temp.close_db()
+        print(f"[{sql_id}] ✓ Column exploration cached")
+    
+    # ===== ✨ 预先执行一次Schema Linking（如果需要）=====
+    # 修改目的：避免投票模式下重复执行Schema Linking，提高效率
+    cached_linked_schema = None
+    
+    if (args.do_schema_linking_vote or args.use_schema_linking) and schema_linker:
+        print(f"[{sql_id}] Pre-executing schema linking...")
+        
+        # 创建临时chat session
+        chat_session_sl_temp = GPTChat(
+            args.azure if hasattr(args, 'azure') else False,
+            args.generation_model,
+            temperature=0
+        )
+        
+        # 执行Schema Linking（只执行一次）
+        linked_schema = schema_linker.link_schema(
+            question=question,
+            table_list=table_list,
+            knowledge=knowledge,
+            chat_session=chat_session_sl_temp
+        )
+        
+        # 缓存结果
+        cached_linked_schema = linked_schema
+        print(f"[{sql_id}] ✓ Schema linking cached")
+    
+    # ===== 格式限制（可选）=====
     format_csv = None
     if args.do_format_restriction:
         chat_session_format = GPTChat(
@@ -282,7 +385,9 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
                         None, False,  # 不使用schema linking
-                        complexity  # 传递复杂度参数
+                        complexity,  # 传递复杂度参数
+                        cached_exploration_result,  # ✨ 传递缓存的列探索结果
+                        None  # 不使用cached_linked_schema（原始schema模式）
                     )
                 )
                 threads.append(thread)
@@ -303,7 +408,9 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
                         schema_linker, True,  # 使用schema linking
-                        complexity  # 传递复杂度参数
+                        complexity,  # 传递复杂度参数
+                        cached_exploration_result,  # ✨ 传递缓存的列探索结果
+                        cached_linked_schema  # ✨ 传递缓存的schema linking结果
                     )
                 )
                 threads.append(thread)
@@ -325,7 +432,9 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         csv_save_pathi, log_pathi, sql_save_pathi,
                         search_directory, format_csv,
                         None, False,
-                        complexity  # 传递复杂度参数
+                        complexity,  # 传递复杂度参数
+                        cached_exploration_result,  # ✨ 传递缓存的列探索结果
+                        None  # 不使用schema linking
                     )
                 )
                 threads.append(thread)
@@ -356,7 +465,7 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             else:
                 print(f"{sql_id}: Empty")
     else:
-        # 直接执行
+        # 直接执行（非投票模式）
         execute_single_question(
             sql_id, question, table_list, knowledge,
             schema_parser, args,
@@ -365,7 +474,9 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             search_directory, format_csv,
             schema_linker if args.use_schema_linking else None,
             args.use_schema_linking if hasattr(args, 'use_schema_linking') else False,
-            complexity  # 传递复杂度参数
+            complexity,  # 传递复杂度参数
+            cached_exploration_result,  # ✨ 传递缓存的列探索结果
+            cached_linked_schema  # ✨ 传递缓存的schema linking结果
         )
     
     elapsed = int((time.time() - start_time) // 60)
