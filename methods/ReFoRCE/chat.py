@@ -50,6 +50,19 @@ class BaseChat(ABC):
 
     def init_messages(self):
         self.messages = []
+    
+    def set_system_prompt(self, system_prompt: str):
+        """
+        设置 System Prompt (在 messages 列表开头)
+        如果已有 system prompt，则替换；否则添加
+        """
+        # 检查是否已有 system prompt
+        if self.messages and self.messages[0]["role"] == "system":
+            # 替换现有的 system prompt
+            self.messages[0]["content"] = system_prompt
+        else:
+            # 在开头插入 system prompt
+            self.messages.insert(0, {"role": "system", "content": system_prompt})
 
 
 from openai import OpenAI, AzureOpenAI

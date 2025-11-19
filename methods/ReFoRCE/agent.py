@@ -10,8 +10,9 @@ from io import StringIO
 import os
 import shutil
 import csv
-from prompt import Prompts
-from typing import Type
+# from prompt import Prompts  # 已废弃
+from prompts.base_prompts import BasePromptManager
+from typing import Type, Union
 from chat import GPTChat
 import sys
 
@@ -24,7 +25,7 @@ except OverflowError:
     csv.field_size_limit(max_int)
 
 class REFORCE:
-    def __init__(self, db_path, sql_data, search_directory, prompt_class: Type[Prompts], sql_env: Type[SqlEnv]=None, chat_session_pre=None, chat_session=None, log_save_path=None, db_id=None, task=None):
+    def __init__(self, db_path, sql_data, search_directory, prompt_class: Union[Type[BasePromptManager], BasePromptManager], sql_env: Type[SqlEnv]=None, chat_session_pre=None, chat_session=None, log_save_path=None, db_id=None, task=None):
         self.csv_save_name = "result.csv"
         self.sql_save_name = "result.sql"
         self.log_save_name = "log.log"
@@ -140,12 +141,22 @@ class REFORCE:
 
     def exploration(self, task, table_struct, table_info, logger):
         pre_info = ''
-        task = table_info + "\nTask: " + task + "\n"
+        
+        # ✨ 使用 System/User 分离模式
+        # System Prompt (只设置一次)
+        system_prompt = self.prompt_class.get_exploration_system_prompt(api=self.api)
+        self.chat_session_pre.set_system_prompt(system_prompt)
+        
+        # User Prompt
+        user_prompt = self.prompt_class.get_exploration_user_prompt(
+            table_info=table_info,
+            question=task,
+            table_struct=table_struct
+        )
+        
         max_try = self.max_try
         while max_try > 0:
-            exploration_prompt = task + self.prompt_class.get_exploration_prompt(self.api, table_struct)
-
-            response_pre = self.chat_session_pre.get_model_response(exploration_prompt, "sql")
+            response_pre = self.chat_session_pre.get_model_response(user_prompt, "sql")
             response_pre_txt = self.chat_session_pre.messages[-1]['content']
             logger.info("[Exploration]\n" + response_pre_txt + "\n[Exploration]")
             if not isinstance(response_pre, list):
@@ -183,18 +194,34 @@ class REFORCE:
         results_values = []
         results_tables = []
 
-        self_refine_prompt = self.prompt_class.get_self_refine_prompt(table_info, task, pre_info, question, self.api, format_csv, table_struct, args.omnisql_format_pth)
+        # ✨ 使用 System/User 分离模式
+        # System Prompt (只设置一次，可复用)
+        system_prompt = self.prompt_class.get_self_refine_system_prompt(
+            api=self.api, 
+            table_struct=table_struct
+        )
+        self.chat_session.set_system_prompt(system_prompt)
+        logger.info("[Self_refine System Prompt]\n" + system_prompt + "\n[Self_refine System Prompt]")
+        
+        # User Prompt (每次迭代可能不同)
+        user_prompt = self.prompt_class.get_self_refine_user_prompt(
+            table_info=table_info,
+            question=question,
+            pre_info=pre_info,
+            format_csv=format_csv,
+            table_struct=table_struct
+        )
 
         error_rec = []
         while itercount < args.max_iter:
             logger.info(f"itercount: {itercount}")
-            logger.info("[Self-refine]\n" + self_refine_prompt + "\n[Self-refine]")
+            logger.info("[Self_refine User Prompt]\n" + user_prompt + "\n[Self_refine User Prompt]")
             
             max_try = self.max_try
             while max_try > 0:
-                response = self.chat_session.get_model_response(self_refine_prompt, "sql")
+                response = self.chat_session.get_model_response(user_prompt, "sql")
                 if not isinstance(response, list) or len(response) != 1:
-                    self_refine_prompt = "Please output one SQL only."
+                    user_prompt = "Please output one SQL only."
                 else:
                     break
                 max_try -= 1
@@ -298,13 +325,20 @@ class REFORCE:
             with open(sql_save_path, "w") as f:
                 f.write(response)
 
-    def model_vote(self, result, sql_paths, search_directory, args, table_info, task):
+    def model_vote(self, result, sql_paths, search_directory, args, table_info, task, knowledge=None):
         chat_session = GPTChat(args.azure, args.model_vote)
         max_value = max(result.values())
         max_dict = {k: v for k, v in result.items() if v == max_value}
         # print(max_dict)
 
-        prompt = f"You are gieven DB info, task and candidate SQLs and their results. You should choose the most correct one based on database info:\n{table_info}. The task is: {task}. Here are some candidate sqls and answers: \n"
+        prompt = f"You are given DB info, task and candidate SQLs and their results. You should choose the most correct one based on database info:\n{table_info}. \n\nThe task is: {task}. \n"
+        
+        # 添加领域知识到prompt
+        if knowledge:
+            prompt += f"\n**Important Domain Knowledge:**\n{knowledge}\n\n"
+            prompt += "Please strictly follow the domain knowledge rules when evaluating the SQL queries.\n\n"
+        
+        prompt += "Here are some candidate sqls and answers: \n"
         for sql, counts in max_dict.items():
             sql_path = os.path.join(search_directory, sql)
             csv_path = os.path.join(search_directory, sql_paths[sql])
@@ -378,7 +412,7 @@ class REFORCE:
                 assert all(v == 0 for k, v in result_all.items()), result
                 result_all = {k: v + 1 for k, v in result_all.items()}
                 # print(result_all)
-                self.model_vote(result_all, sql_paths, search_directory, args, table_info, task)
+                self.model_vote(result_all, sql_paths, search_directory, args, table_info, task, knowledge=knowledge)
             elif args.final_choose:
                 csv_pth = all_values[0]
                 # 确保目标目录存在
@@ -400,7 +434,7 @@ class REFORCE:
         if has_tie:
             assert num_with_max_vote % (max_vote + 1) == 0, result_name
             if args.model_vote:
-                self.model_vote(result, sql_paths, search_directory, args, table_info, task)
+                self.model_vote(result, sql_paths, search_directory, args, table_info, task, knowledge=knowledge)
                 return
             if not args.random_vote_for_tie:
                 print(f"{search_directory} has_tie {sorted_dict}, return")

@@ -191,7 +191,8 @@ def process_sql_data(sql_data):
         if "result.sql" not in os.listdir(search_directory):
             if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
                 # After all processes have completed, perform the vote result
-                agent_format.vote_result(search_directory, args, sql_paths, table_info, question)
+                # 原版不支持knowledge，传递None保持向后兼容
+                agent_format.vote_result(search_directory, args, sql_paths, table_info, question, knowledge=None)
             else:
                 print(f"{sql_data}: Empty")
     else:

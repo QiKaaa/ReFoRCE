@@ -8,7 +8,8 @@ import glob
 from utils import initialize_logger
 from agent import REFORCE
 from chat import GPTChat
-from prompt_starrocks import PromptsStarRocks
+# from prompt_starrocks import PromptsStarRocks  # 已废弃
+from prompts.starrocks_prompts import StarRocksPromptManager
 import threading
 import concurrent.futures
 import time
@@ -21,6 +22,9 @@ from dotenv import load_dotenv
 
 # 导入 Schema Linking
 from schema_linking_optimized import OptimizedSchemaLinker
+
+# ✨ 导入业务领域知识管理器
+from domain_knowledge import DomainKnowledge
 
 # 加载.env文件中的环境变量
 load_dotenv()
@@ -344,11 +348,11 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
         if "result.sql" not in os.listdir(search_directory):
             if any(file.endswith('.sql') for file in os.listdir(search_directory) 
                    if os.path.isfile(os.path.join(search_directory, file))):
-                # 执行投票
+                # 执行投票 - 传递knowledge参数
                 table_info = schema_parser.get_tables_chunks(table_list)
                 if knowledge:
                     table_info += f"Domain Knowledge:\n{knowledge}"
-                agent_format.vote_result(search_directory, args, sql_paths, table_info, question)
+                agent_format.vote_result(search_directory, args, sql_paths, table_info, question, knowledge=knowledge)
             else:
                 print(f"{sql_id}: Empty")
     else:
@@ -760,8 +764,11 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # 初始化Prompt类
-    prompt_all = PromptsStarRocks()
+    # ✨ 获取业务领域通用知识
+    domain_knowledge_general = DomainKnowledge.get_rules_for_prompt(include_specific=True)
+    
+    # ✨ 初始化Prompt管理器（注入业务知识）
+    prompt_all = StarRocksPromptManager(domain_knowledge=domain_knowledge_general)
     
     # 创建输出目录
     os.makedirs(args.output_path, exist_ok=True)

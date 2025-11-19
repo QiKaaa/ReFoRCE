@@ -19,6 +19,8 @@ import argparse
 
 # 导入 GPT Chat
 from chat import GPTChat
+# 导入 Schema Linking Prompt 管理器
+from prompts.schema_linking_prompts import SchemaLinkingPromptManager
 
 # 设置 CSV 字段大小限制 (处理 Windows 平台的限制)
 try:
@@ -27,70 +29,22 @@ except OverflowError:
     csv.field_size_limit(2**31 - 1)
 
 
-# LLM Prompt for Schema Linking
-SCHEMA_LINKING_PROMPT = """You are performing column-level schema linking for SQL generation.
-
-Given:
-1. Question: The user's question that needs to be answered
-2. Knowledge: Domain-specific knowledge and constraints
-3. All Table Schemas: Complete schemas of all relevant tables in M-schema format
-
-Your task:
-Analyze which columns from each table are relevant to answer the question, considering the knowledge constraints and table relationships.
-
-Rules:
-1. Select ALL columns that might be needed (including filter columns, join columns, and output columns)
-2. Always keep ID fields and date/time fields
-3. Consider both direct usage and indirect usage (e.g., for JOINs)
-4. Consider relationships between tables when selecting columns
-5. Return the selected columns in the EXACT same format as shown in the table schemas
-
-Please respond ONLY with a JSON code block:
-```json
-{{
-    "think": "Brief reasoning about which columns are relevant and why, including table relationships",
-    "tables": {{
-        "table_name1": [
-            "(column_name1: type, comment, Examples: [examples])",
-            "(column_name2: type, comment, Examples: [examples])",
-            ...
-        ],
-        "table_name2": [
-            "(column_name1: type, comment, Examples: [examples])",
-            ...
-        ]
-    }}
-}}
-```
-
-Important: Copy the column definition EXACTLY as it appears in the table schema, including the parentheses, colon, comma, and examples.
-
----
-
-Question: {question}
-
-Knowledge: {knowledge}
-
-All Table Schemas:
-{all_table_schemas}
-
-Please analyze and return the selected columns for each table in the JSON format above.
-"""
-
-
 class OptimizedSchemaLinker:
     """优化的 Schema Linking 类 (基于 LLM)"""
     
-    def __init__(self, schema_file: str, chat_session: Optional[GPTChat] = None):
+    def __init__(self, schema_file: str, chat_session: Optional[GPTChat] = None, domain_knowledge: str = None):
         """
         初始化
         Args:
             schema_file: schema 文件路径 (如 final_algorithm_competition.txt)
             chat_session: GPT Chat 会话 (可选)
+            domain_knowledge: 业务领域通用知识（可选）
         """
         self.schema_file = schema_file
         self.all_tables = {}  # {table_name: table_schema_text}
         self.chat_session = chat_session
+        # ✨ 初始化 prompt 管理器（传递业务知识）
+        self.prompt_manager = SchemaLinkingPromptManager(domain_knowledge=domain_knowledge)
         self._load_schema()
     
     def _load_schema(self):
@@ -186,8 +140,8 @@ class OptimizedSchemaLinker:
         # 合并所有表的 schema
         combined_schemas = "\n\n".join(all_table_schemas)
         
-        # 构建 prompt (一次性给所有表)
-        prompt = SCHEMA_LINKING_PROMPT.format(
+        # 使用 prompt 管理器构建 prompt
+        prompt = self.prompt_manager.get_schema_linking_prompt(
             question=question,
             knowledge=knowledge if knowledge else "None",
             all_table_schemas=combined_schemas
