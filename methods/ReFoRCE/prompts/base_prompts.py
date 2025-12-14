@@ -568,3 +568,37 @@ For each SQL, answer in ```sql
     def get_prompt_dialect_list_all_tables(self, table_struct: str, api: str) -> str:
         """兼容旧接口"""
         return self._get_dialect_list_tables_rules(table_struct, api)
+    
+    def get_self_refine_prompt_on_error(self, error_message: str, current_sql: str, question: str) -> str:
+        """
+        生成错误修正的 User Prompt
+        用于在 SQL 执行出现错误时引导 LLM 修正
+        
+        Args:
+            error_message: 错误信息
+            current_sql: 当前的 SQL 查询
+            question: 原始问题
+            
+        Returns:
+            str: User prompt 用于错误修正
+        """
+        return f"""An error occurred during SQL execution:
+
+**Error:** {error_message}
+
+**Current SQL:**
+```sql
+{current_sql}
+```
+
+**Original Question:** {question}
+
+Please analyze the error and generate a corrected SQL query. Consider:
+1. What caused this error?
+2. How can the SQL be fixed while maintaining the original intent?
+3. Are there any logical issues in the current query?
+
+Output the corrected SQL in the following format:
+```sql
+-- Your corrected SQL here
+```"""
