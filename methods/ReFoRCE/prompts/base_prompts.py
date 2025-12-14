@@ -528,6 +528,23 @@ For each SQL, answer in ```sql
         """兼容旧接口"""
         return self.get_format_analysis_system_prompt()
     
+    def get_exploration_refine_prompt(self, sql: str, corrected_sql: str, sqls: list, res: str) -> str:
+        """
+        探索阶段SQL修正后的批量优化prompt
+        用于根据一个SQL的修正结果，优化其他待执行的SQL
+        """
+        return f"""```sql
+{sql}``` is corrected to ```sql
+{corrected_sql}```. And the result is: 
+{res}
+
+Please correct other sqls based on results if they have similar errors. Otherwise don't modify the SQL. 
+SQLs: {sqls}. 
+For each SQL, answer in ```sql
+--Description: 
+``` format.
+"""
+    
     def get_exploration_self_correct_prompt(self, sql: str, error: str) -> str:
         """兼容旧接口"""
         return self.get_error_correction_user_prompt(sql, error)

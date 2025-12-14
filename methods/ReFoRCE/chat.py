@@ -64,6 +64,14 @@ class BaseChat(ABC):
             # 在开头插入 system prompt
             self.messages.insert(0, {"role": "system", "content": system_prompt})
 
+    def clear_messages(self, keep_system_prompt: bool = False):
+        """清理历史对话，可选择保留 system prompt"""
+        if keep_system_prompt and self.messages and self.messages[0]["role"] == "system":
+            system_message = self.messages[0]
+            self.messages = [system_message]
+        else:
+            self.messages = []
+
 
 from openai import OpenAI, AzureOpenAI
 import os
@@ -78,7 +86,7 @@ class GPTChat(BaseChat):
                     api_key=os.environ.get("OPENAI_API_KEY"),
                     api_version="2024-12-01-preview"
                 )
-            elif model in ["deepseek-chat"]:
+            elif model in ["deepseek-chat", "deepseek-reasoner"]:
                 self.client = OpenAI(
                     base_url="https://api.deepseek.com",
                     api_key=os.environ.get("DS_API_KEY"),

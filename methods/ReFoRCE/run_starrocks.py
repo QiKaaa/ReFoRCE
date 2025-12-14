@@ -22,9 +22,13 @@ from dotenv import load_dotenv
 
 # 导入 Schema Linking
 from schema_linking_optimized import OptimizedSchemaLinker
+from parallel_schema_linker import ParallelSchemaLinker
 
 # ✨ 导入业务领域知识管理器
 from domain_knowledge import DomainKnowledge
+
+# ✨ 导入分解模块（Scaler已合并到agent.py）
+from decomposer_starrocks import StarRocksDecomposer
 
 # 加载.env文件中的环境变量
 load_dotenv()
@@ -45,7 +49,10 @@ def execute_single_question(
     schema_linker=None, use_schema_linking=False,
     complexity='unknown',
     cached_exploration_result=None,  # ✨ 新增:缓存的列探索结果
-    cached_linked_schema=None  # ✨ 新增:缓存的schema linking结果
+    cached_linked_schema=None,  # ✨ 新增:缓存的schema linking结果(M-schema文本)
+    cached_schema_links=None,  # ✨ 新增:缓存的schema links结果({"tables": [...], "columns": [...]})
+    prompt_manager=None,  # ✨ 新增:Prompt管理器
+    thread_prefix=""  # ✨ 新增:线程前缀（用于区分linked/original）
 ):
     """
     执行单个问题
@@ -66,7 +73,9 @@ def execute_single_question(
         use_schema_linking: 是否使用Schema Linking
         complexity: 问题复杂度（简单/中等/复杂）
         cached_exploration_result: 缓存的列探索结果(pre_info, response_pre_txt) ✨
-        cached_linked_schema: 缓存的schema linking结果 ✨
+        cached_linked_schema: 缓存的schema linking结果(M-schema文本) ✨
+        cached_schema_links: 缓存的schema links结果({"tables": [...], "columns": [...]}) ✨
+        thread_prefix: 线程前缀，用于区分文件来源（如 "linked_0", "original_1"）✨
     """
     
     # 如果结果已存在且不允许覆盖，则跳过
@@ -100,7 +109,7 @@ def execute_single_question(
             # 创建 chat session
             chat_session_sl = GPTChat(
                 args.azure if hasattr(args, 'azure') else False,
-                args.generation_model,
+                args.schema_linking_model if hasattr(args, 'schema_linking_model') else args.generation_model,
                 temperature=0
             )
             
@@ -172,7 +181,7 @@ def execute_single_question(
         db_path=None,  # StarRocks不需要db_path
         sql_data=sql_id,
         search_directory=search_directory,
-        prompt_class=prompt_all,
+        prompt_class=prompt_manager,
         sql_env=sql_env,
         chat_session_pre=chat_session_ex,
         chat_session=chat_session,
@@ -202,26 +211,227 @@ def execute_single_question(
     csv_save_path_full = os.path.join(search_directory, csv_save_path)
     sql_save_path_full = os.path.join(search_directory, sql_save_path)
     
-    # 生成SQL
-    if args.do_self_refinement:
-        agent.self_refine(
-            args, logger, question, format_csv, 
-            table_struct, table_info, response_pre_txt, pre_info,
-            csv_save_path_full, sql_save_path_full, task=question
+    # ===== ✨ 分解-合并流程（中等/困难题目）=====
+    use_decompose_scale = False
+    if args.use_decompose and complexity in ['中等', '复杂']:
+        logger.info(f"[Decompose-Scale] Enabled for complexity: {complexity}")
+        use_decompose_scale = True
+        
+        # 1. 初始化Decomposer
+        decomposer = StarRocksDecomposer(
+            chat_session=GPTChat(args.azure, args.decompose_model if hasattr(args, 'decompose_model') else args.generation_model),
+            azure=args.azure,
+            model=args.decompose_model if hasattr(args, 'decompose_model') else args.generation_model
         )
-    elif args.generation_model:
-        agent.gen(
-            args, logger, question, format_csv,
-            table_struct, table_info, response_pre_txt, pre_info,
-            csv_save_path_full, sql_save_path_full, task=question
+        
+        # 2. 执行问题分解
+        logger.info("[Decompose] Starting question decomposition...")
+        qa_pairs = decomposer.decompose(
+            question=question,
+            schema=table_info,
+            evidence=knowledge if knowledge else "",
+            schema_links="",  # 可以传递Schema Linking结果
+            few_shot_examples=pre_info if pre_info else "",
+            logger=logger
         )
+        
+        if not qa_pairs:
+            logger.warning("[Decompose] No sub-questions generated, falling back to normal flow")
+            use_decompose_scale = False
+        else:
+            logger.info(f"[Decompose] Generated {len(qa_pairs)} sub-questions")
+            
+            # 保存分解结果
+            decompose_dir = os.path.join(search_directory, "decomposition")
+            decomposer.save_decomposition(qa_pairs, decompose_dir, sql_id)
+            
+            # 3. 处理每个子问题SQL
+            refined_qa_pairs = []
+            for sub_id, (sub_q, sub_sql) in enumerate(qa_pairs, 1):
+                logger.info(f"[Sub-Question {sub_id}] Processing: {sub_q}")
+                
+                # 应用self-refinement到子问题SQL
+                refined_sql, csv_path = agent.process_sub_question_sql(
+                    sub_sql=sub_sql,
+                    sub_question=sub_q,
+                    sub_id=sub_id,
+                    args=args,
+                    logger=logger,
+                    table_info=table_info,
+                    search_directory=decompose_dir,
+                    task=question
+                )
+                
+                refined_qa_pairs.append((sub_q, refined_sql))
+                logger.info(f"[Sub-Question {sub_id}] ✓ Refined")
+            
+            # 4. 创建专用于SQL合并的chat session
+            chat_session_scale = GPTChat(
+                args.azure, 
+                args.scale_model if hasattr(args, 'scale_model') else args.generation_model
+            )
+            
+            logger.info("[Scale] Starting SQL synthesis...")
+            
+            # 🔧 修改：每个线程只生成一个SQL候选（不是多个）
+            # 策略选择：根据thread_prefix中的编号决定是否使用fallback
+            if args.do_vote and args.use_decompose:
+                # 提取线程编号，决定使用哪种策略
+                thread_index = 0
+                if thread_prefix:
+                    parts = thread_prefix.split('_')
+                    if len(parts) > 1 and parts[1].isdigit():
+                        thread_index = int(parts[1])
+                
+                # 每3个线程中有1个使用fallback（第2, 5, 8...个线程）
+                use_fallback = (thread_index % 3 == 2)
+                
+                logger.info(f"[Scale] Thread {thread_prefix}: Using {'fallback' if use_fallback else 'normal'} strategy")
+                
+                # 🔧 准备schema_links参数（使用缓存的schema linking结果）
+                schema_links_for_scale = ""
+                if use_schema_linking and cached_linked_schema:
+                    schema_links_for_scale = cached_linked_schema
+                    logger.info("[Scale] Using cached schema linking result")
+                
+                # 生成单个SQL候选
+                final_sql = agent.scale_sql(
+                    question=question,
+                    schema=table_info,
+                    qa_pairs=refined_qa_pairs,
+                    evidence=knowledge if knowledge else "",
+                    schema_links=schema_links_for_scale,  # ✨ 使用缓存的结果
+                    few_shot_examples=pre_info if pre_info else "",
+                    use_fallback=use_fallback,
+                    chat_session=chat_session_scale,
+                    logger=logger
+                )
+                
+                if not final_sql:
+                    logger.error("[Scale] Failed to generate SQL")
+                    return
+                
+                # ✨ 确定文件前缀（用于区分来源）
+                if thread_prefix:
+                    # 直接使用thread_prefix作为文件前缀（如 "linked_0", "original_0"）
+                    file_prefix = thread_prefix
+                else:
+                    file_prefix = "vote"
+                
+                logger.info(f"[Scale] Using file prefix: {file_prefix}")
+                
+                # 保存SQL候选文件
+                vote_csv_path = os.path.join(search_directory, f"{file_prefix}_result.csv")
+                vote_sql_path = os.path.join(search_directory, f"{file_prefix}_result.sql")
+                
+                # ✨ 对生成的SQL进行self-refinement
+                logger.info(f"[Scale] Refining generated SQL...")
+                # 🔧 优先使用final_sql_max_iter，如果未设置则使用max_iter
+                refine_max_iter = args.final_sql_max_iter if args.final_sql_max_iter else args.max_iter
+                final_sql = agent.refine_final_sql(
+                    initial_sql=final_sql,
+                    question=question,
+                    schema=table_info,
+                    evidence=knowledge if knowledge else "",
+                    schema_links=schema_links_for_scale,  # ✨ 使用相同的缓存结果
+                    max_iter=refine_max_iter,
+                    sql_id=f"{sql_id}_{thread_prefix if thread_prefix else 'default'}",
+                    csv_save_path=vote_csv_path,
+                    sql_save_path=vote_sql_path,
+                    table_struct=table_struct,
+                    chat_session=chat_session_scale,
+                    logger=logger
+                )
+                
+                if final_sql:
+                    logger.info(f"[Scale] SQL candidate generated and refined successfully")
+                else:
+                    logger.warning(f"[Scale] Failed to refine SQL")
+                
+                # ✨ 不在线程内部投票，等待所有线程完成后统一投票
+                logger.info(f"[Decompose-Vote] Generated 1 candidate with prefix '{file_prefix}'")
+            else:
+                # 单次合并模式
+                # 🔧 准备schema_links参数（使用缓存的schema linking结果）
+                schema_links_for_scale = ""
+                if use_schema_linking and cached_linked_schema:
+                    schema_links_for_scale = cached_linked_schema
+                    logger.info("[Scale] Using cached schema linking result")
+                
+                final_sql = agent.scale_sql(
+                    question=question,
+                    schema=table_info,
+                    qa_pairs=refined_qa_pairs,
+                    evidence=knowledge if knowledge else "",
+                    schema_links=schema_links_for_scale,  # ✨ 使用缓存的结果
+                    few_shot_examples=pre_info if pre_info else "",
+                    use_fallback=False,
+                    chat_session=chat_session_scale,
+                    logger=logger
+                )
+                
+                logger.info(f"[Scale] Initial final SQL generated:\n{final_sql}")
+                
+                # ✨ 如果启用最终SQL refinement，进行优化
+                if args.do_final_sql_refinement:
+                    logger.info("[Scale-Refine] Starting final SQL refinement...")
+                    # 🔧 优先使用final_sql_max_iter，如果未设置则使用max_iter
+                    refine_max_iter = args.final_sql_max_iter if args.final_sql_max_iter else args.max_iter
+                    final_sql = agent.refine_final_sql(
+                        initial_sql=final_sql,
+                        question=question,
+                        schema=table_info,
+                        evidence=knowledge if knowledge else "",
+                        schema_links=schema_links_for_scale,  # ✨ 使用缓存的结果
+                        max_iter=refine_max_iter,
+                        sql_id=sql_id,
+                        csv_save_path=csv_save_path_full,
+                        sql_save_path=sql_save_path_full,
+                        table_struct=table_struct,
+                        chat_session=chat_session_scale,
+                        logger=logger
+                    )
+                    logger.info("[Scale-Refine] ✓ Final SQL refinement complete")
+                else:
+                    # 不进行refinement，直接执行
+                    result = agent.sql_env.execute_sql_api(
+                        final_sql, 
+                        sql_id,
+                        csv_save_path_full,
+                        api=agent.api,
+                        sqlite_path=agent.sqlite_path
+                    )
+                    
+                    if result == '0':
+                        with open(sql_save_path_full, 'w', encoding='utf-8') as f:
+                            f.write(final_sql)
+                        logger.info("[Scale] ✓ Final SQL executed successfully")
+                    else:
+                        logger.error(f"[Scale] Final SQL execution failed: {result}")
+                        use_decompose_scale = False  # 失败则回退到常规流程
+    
+    # ===== 常规SQL生成流程 =====
+    if not use_decompose_scale:
+        # 生成SQL
+        if args.do_self_refinement:
+            agent.self_refine(
+                args, logger, question, format_csv, 
+                table_struct, table_info, response_pre_txt, pre_info,
+                csv_save_path_full, sql_save_path_full, task=question
+            )
+        elif args.generation_model:
+            agent.gen(
+                args, logger, question, format_csv,
+                table_struct, table_info, response_pre_txt, pre_info,
+                csv_save_path_full, sql_save_path_full, task=question
+            )
     
     # 关闭数据库连接
     if args.generation_model:
         agent.sql_env.close_db()
 
 
-def process_question(sql_id, example, schema_parser, schema_linker, args):
+def process_question(sql_id, example, schema_parser, schema_linker, args, prompt_manager):
     """处理单个问题（用于并行执行）"""
     start_time = time.time()
     
@@ -244,7 +454,7 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
         db_path=None,
         sql_data=sql_id,
         search_directory=search_directory,
-        prompt_class=prompt_all
+        prompt_class=prompt_manager
     )
     
     # 跳过已完成的
@@ -300,7 +510,7 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             db_path=None,
             sql_data=sql_id,
             search_directory=search_directory,
-            prompt_class=prompt_all,
+            prompt_class=prompt_manager,
             sql_env=sql_env_temp,
             chat_session_pre=chat_session_ex_temp,
             chat_session=None,
@@ -328,6 +538,7 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
     # ===== ✨ 预先执行一次Schema Linking（如果需要）=====
     # 修改目的：避免投票模式下重复执行Schema Linking，提高效率
     cached_linked_schema = None
+    cached_schema_links = None
     
     if (args.do_schema_linking_vote or args.use_schema_linking) and schema_linker:
         print(f"[{sql_id}] Pre-executing schema linking...")
@@ -335,21 +546,25 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
         # 创建临时chat session
         chat_session_sl_temp = GPTChat(
             args.azure if hasattr(args, 'azure') else False,
-            args.generation_model,
+            args.schema_linking_model if hasattr(args, 'schema_linking_model') else args.generation_model,
             temperature=0
         )
         
         # 执行Schema Linking（只执行一次）
-        linked_schema = schema_linker.link_schema(
+        schema_links, linked_schema = schema_linker.link_schema(
             question=question,
             table_list=table_list,
             knowledge=knowledge,
             chat_session=chat_session_sl_temp
         )
         
-        # 缓存结果
-        cached_linked_schema = linked_schema
-        print(f"[{sql_id}] ✓ Schema linking cached")
+        # 缓存两个结果
+        cached_linked_schema = linked_schema  # M-schema文本
+        cached_schema_links = schema_links    # {"tables": [...], "columns": [...]}
+        
+        print(f"[{sql_id}] ✓ Schema linking cached:")
+        print(f"  - Tables: {len(schema_links.get('tables', []))}")
+        print(f"  - Columns: {len(schema_links.get('columns', []))}")
     
     # ===== 格式限制（可选）=====
     format_csv = None
@@ -371,27 +586,30 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             num_votes = args.num_votes
             
             # 第一组：使用原始Schema生成（num_votes次）
-            for i in range(num_votes):
-                csv_save_pathi = f"original_{i}_{agent_format.csv_save_name}"
-                log_pathi = f"original_{i}_{agent_format.log_save_name}"
-                sql_save_pathi = f"original_{i}_{agent_format.sql_save_name}"
-                sql_paths[sql_save_pathi] = csv_save_pathi
+            # for i in range(num_votes):
+            #     csv_save_pathi = f"original_{i}_{agent_format.csv_save_name}"
+            #     log_pathi = f"original_{i}_{agent_format.log_save_name}"
+            #     sql_save_pathi = f"original_{i}_{agent_format.sql_save_name}"
+            #     sql_paths[sql_save_pathi] = csv_save_pathi
                 
-                thread = threading.Thread(
-                    target=execute_single_question,
-                    args=(
-                        sql_id, question, table_list, knowledge,
-                        schema_parser, args,
-                        csv_save_pathi, log_pathi, sql_save_pathi,
-                        search_directory, format_csv,
-                        None, False,  # 不使用schema linking
-                        complexity,  # 传递复杂度参数
-                        cached_exploration_result,  # ✨ 传递缓存的列探索结果
-                        None  # 不使用cached_linked_schema（原始schema模式）
-                    )
-                )
-                threads.append(thread)
-                thread.start()
+            #     thread = threading.Thread(
+            #         target=execute_single_question,
+            #         args=(
+            #             sql_id, question, table_list, knowledge,
+            #             schema_parser, args,
+            #             csv_save_pathi, log_pathi, sql_save_pathi,
+            #             search_directory, format_csv,
+            #             None, False,  # 不使用schema linking
+            #             complexity,  # 传递复杂度参数
+            #             cached_exploration_result,  # ✨ 传递缓存的列探索结果
+            #             None,  # 不使用cached_linked_schema（原始schema模式）
+            #             None,  # 不使用cached_schema_links（原始schema模式）
+            #             prompt_manager,  # ✨ 传递prompt_manager
+            #             f"original_{i}"  # ✨ 传递线程前缀
+            #         )
+            #     )
+            #     threads.append(thread)
+            #     thread.start()
             
             # 第二组：使用Schema Linking生成（num_votes次）
             for i in range(num_votes):
@@ -410,7 +628,10 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         schema_linker, True,  # 使用schema linking
                         complexity,  # 传递复杂度参数
                         cached_exploration_result,  # ✨ 传递缓存的列探索结果
-                        cached_linked_schema  # ✨ 传递缓存的schema linking结果
+                        cached_linked_schema,  # ✨ 传递缓存的M-schema文本
+                        cached_schema_links,  # ✨ 传递缓存的schema links
+                        prompt_manager,  # ✨ 传递prompt_manager
+                        f"linked_{i}"  # ✨ 传递线程前缀
                     )
                 )
                 threads.append(thread)
@@ -434,7 +655,10 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
                         None, False,
                         complexity,  # 传递复杂度参数
                         cached_exploration_result,  # ✨ 传递缓存的列探索结果
-                        None  # 不使用schema linking
+                        None,  # 不使用cached_linked_schema
+                        None,  # 不使用cached_schema_links
+                        prompt_manager,  # ✨ 传递prompt_manager
+                        f"vote_{i}"  # ✨ 传递线程前缀
                     )
                 )
                 threads.append(thread)
@@ -457,11 +681,24 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
         if "result.sql" not in os.listdir(search_directory):
             if any(file.endswith('.sql') for file in os.listdir(search_directory) 
                    if os.path.isfile(os.path.join(search_directory, file))):
-                # 执行投票 - 传递knowledge参数
-                table_info = schema_parser.get_tables_chunks(table_list)
-                if knowledge:
-                    table_info += f"Domain Knowledge:\n{knowledge}"
-                agent_format.vote_result(search_directory, args, sql_paths, table_info, question, knowledge=knowledge)
+                # 🔧 重新收集实际生成的SQL文件（支持decompose场景）
+                candidate_sql_files = {}
+                for filename in os.listdir(search_directory):
+                    if filename.endswith('_result.sql') and filename != 'result.sql':
+                        # 找到对应的CSV文件
+                        csv_filename = filename.replace('.sql', '.csv')
+                        csv_path = os.path.join(search_directory, csv_filename)
+                        if os.path.exists(csv_path):
+                            candidate_sql_files[filename] = csv_filename
+                
+                if candidate_sql_files:
+                    # 执行投票 - 传递knowledge参数
+                    table_info = schema_parser.get_tables_chunks(table_list)
+                    if knowledge:
+                        table_info += f"Domain Knowledge:\n{knowledge}"
+                    agent_format.vote_result(search_directory, args, candidate_sql_files, table_info, question, knowledge=knowledge)
+                else:
+                    print(f"{sql_id}: No valid candidates for voting")
             else:
                 print(f"{sql_id}: Empty")
     else:
@@ -476,7 +713,10 @@ def process_question(sql_id, example, schema_parser, schema_linker, args):
             args.use_schema_linking if hasattr(args, 'use_schema_linking') else False,
             complexity,  # 传递复杂度参数
             cached_exploration_result,  # ✨ 传递缓存的列探索结果
-            cached_linked_schema  # ✨ 传递缓存的schema linking结果
+            cached_linked_schema,  # ✨ 传递缓存的M-schema文本
+            cached_schema_links,  # ✨ 传递缓存的schema links
+            prompt_manager,  # ✨ 传递prompt_manager
+            ""  # ✨ 非投票模式不需要线程前缀
         )
     
     elapsed = int((time.time() - start_time) // 60)
@@ -627,7 +867,7 @@ def evaluate_with_golden_sql(sql_id, search_directory, golden_sql, args):
     sql_env.close_db()
 
 
-def main(args):
+def main(args, prompt_manager):
     """主函数"""
     
     # 加载数据集
@@ -653,7 +893,7 @@ def main(args):
     schema_linker = None
     if args.do_schema_linking_vote or args.use_schema_linking:
         print(f"Initializing Schema Linker...")
-        schema_linker = OptimizedSchemaLinker(schema_file=args.schema_path)
+        schema_linker = ParallelSchemaLinker(schema_file=args.schema_path)
         print(f"  ✓ Schema Linker ready with {len(schema_linker.all_tables)} tables")
     
     # 获取所有示例
@@ -676,7 +916,7 @@ def main(args):
     print(f"\n开始处理（使用 {args.num_workers} 个worker）...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         futures = [
-            executor.submit(process_question, sql_id, example, schema_parser, schema_linker, args)
+            executor.submit(process_question, sql_id, example, schema_parser, schema_linker, args, prompt_manager)
             for sql_id, example in examples_dict.items()
         ]
         for future in concurrent.futures.as_completed(futures):
@@ -895,6 +1135,8 @@ if __name__ == '__main__':
                        help="列探索模型")
     parser.add_argument('--format_model', type=str, default="deepseek-chat",
                        help="格式化模型")
+    parser.add_argument('--schema_linking_model', type=str, default="deepseek-chat",
+                       help="Schema Linking模型")
     parser.add_argument('--model_vote', type=str, default=None,
                        help="投票模型")
     
@@ -916,8 +1158,24 @@ if __name__ == '__main__':
     parser.add_argument('--use_schema_linking', action="store_true",
                        help="直接使用Schema Linking（不投票模式）")
     
+    # ✨ 分解-合并模块（中等/困难题目）
+    parser.add_argument('--use_decompose', action="store_true",
+                       help="启用分解-合并流程（自动对中等/复杂题目进行子问题分解和SQL合并）")
+    parser.add_argument('--decompose_model', type=str, default="deepseek-reasoner",
+                       help="问题分解模型（默认与generation_model相同）")
+    parser.add_argument('--scale_model', type=str, default="deepseek-chat",
+                       help="SQL合并模型（默认与generation_model相同）")
+    parser.add_argument('--sub_question_max_iter', type=int, default=3,
+                       help="子问题的最大迭代次数（默认3，通常比主问题的max_iter更小）")
+    parser.add_argument('--final_sql_max_iter', type=int, default=None,
+                       help="最终合并SQL的最大refinement迭代次数（默认None，使用max_iter的值）")
+    parser.add_argument('--do_final_sql_refinement', action="store_true",
+                       help="对最终合并SQL进行refinement优化")
+    parser.add_argument('--do_final_sql_consistency', action="store_true",
+                       help="对最终合并SQL使用self-consistency投票")
+    
     # 运行参数
-    parser.add_argument('--max_iter', type=int, default=5, help="最大迭代次数")
+    parser.add_argument('--max_iter', type=int, default=5, help="主问题的最大迭代次数")
     parser.add_argument('--temperature', type=float, default=1.0, help="采样温度")
     parser.add_argument('--num_votes', type=int, default=3, help="投票次数")
     parser.add_argument('--num_workers', type=int, default=10, help="并行worker数量")
@@ -962,4 +1220,4 @@ if __name__ == '__main__':
     os.makedirs(args.output_path, exist_ok=True)
     
     # 运行
-    main(args)
+    main(args, prompt_all)

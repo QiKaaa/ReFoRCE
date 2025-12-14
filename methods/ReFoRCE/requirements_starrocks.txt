@@ -18,3 +18,4 @@ pymysql
 
 # 环境配置
 python-dotenv
+loguru
